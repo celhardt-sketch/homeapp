@@ -8,6 +8,18 @@ Web app for tracking recurring maintenance tasks per room, opened by scanning an
 - Notes can be added to a task, optionally flagged "something needs to be purchased" — those show up on the **To Buy** page.
 - **Manage** page (password-protected admin panel): add/edit/delete rooms and tasks, copy each room's NFC link, change the admin password. Checking off tasks and adding notes does not require login.
 
+- **Pantry** page: track what's stocked; mark items "low" and they appear on To Buy.
+- **Meds** page: log each prescription pickup (date + who for). A reorder reminder is due 28 days later (adjustable), shown in-app and emailed.
+
+## Reminder emails
+
+The server checks hourly for medications past their reorder date and emails the address set on the Manage page (or `REMINDER_EMAIL`). Configure one provider via environment variables:
+
+- Resend: `RESEND_API_KEY` (and optionally `REMINDER_FROM`, default `onboarding@resend.dev` which only delivers to your own Resend account email until you verify a domain).
+- SMTP (e.g. Gmail app password): `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASS`, optional `REMINDER_FROM`.
+
+Without either, reminders are still shown in the app.
+
 ## Admin password
 
 The first time the server starts it sets the admin password from the `ADMIN_PASSWORD` environment variable (default `admin`). Change it from the Manage page (key icon) — the stored password then lives in the database and `ADMIN_PASSWORD` is no longer consulted.

@@ -57,6 +57,48 @@ export interface ActivityItem extends Completion {
   room_slug: string
 }
 
+export interface PantryItem {
+  id: number
+  name: string
+  category: string
+  quantity: string
+  low: boolean
+  updated_by: string
+  updated_at: string
+}
+
+export type MedStatus = 'none' | 'ok' | 'soon' | 'due'
+
+export interface Medication {
+  id: number
+  name: string
+  person: string
+  reorder_days: number
+  notes: string
+  active: boolean
+  last_picked_up_on: string | null
+  last_picked_up_by: string | null
+  last_pickup_id: number | null
+  reminder_sent_at: string | null
+  reorder_on: string | null
+  days_left: number | null
+  status: MedStatus
+}
+
+export interface Pickup {
+  id: number
+  medication_id: number
+  picked_up_on: string
+  picked_up_by: string
+  reminder_sent_at: string | null
+}
+
+export interface ReminderSettings {
+  reminder_email: string
+  email_configured: boolean
+  due: { medication_id: number; name: string; person: string; reorder_on: string }[]
+}
+
 const TOKEN_KEY = 'hm:adminToken'
 
 export function getAdminToken(): string | null {
@@ -128,6 +170,40 @@ export const api = {
 
   shopping: () => request<ShoppingItem[]>('/api/shopping'),
   activity: () => request<ActivityItem[]>('/api/activity'),
+
+  pantry: () => request<PantryItem[]>('/api/pantry'),
+  createPantryItem: (body: { name: string; category?: string; quantity?: string; low?: boolean; updated_by: string }) =>
+    request<PantryItem>('/api/pantry', { method: 'POST', body: JSON.stringify(body) }),
+  updatePantryItem: (id: number, body: Partial<Pick<PantryItem, 'name' | 'category' | 'quantity' | 'low'>> & { updated_by: string }) =>
+    request<PantryItem>(`/api/pantry/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deletePantryItem: (id: number) => request<void>(`/api/pantry/${id}`, { method: 'DELETE' }),
+
+  medications: () => request<Medication[]>('/api/medications'),
+  createMedication: (body: { name: string; person: string; reorder_days: number; notes?: string }) =>
+    request<Medication>('/api/medications', { method: 'POST', body: JSON.stringify(body) }),
+  updateMedication: (id: number, body: Partial<Pick<Medication, 'name' | 'person' | 'reorder_days' | 'notes' | 'active'>>) =>
+    request<Medication>(`/api/medications/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteMedication: (id: number) => request<void>(`/api/medications/${id}`, { method: 'DELETE' }),
+  logPickup: (id: number, body: { picked_up_on: string; picked_up_by: string }) =>
+    request<Medication>(`/api/medications/${id}/pickups`, { method: 'POST', body: JSON.stringify(body) }),
+  pickupHistory: (id: number) => request<Pickup[]>(`/api/medications/${id}/pickups`),
+  deletePickup: (id: number) => request<void>(`/api/pickups/${id}`, { method: 'DELETE' }),
+
+  reminderSettings: () => request<ReminderSettings>('/api/admin/reminders'),
+  saveReminderSettings: (reminder_email: string) =>
+    request<ReminderSettings>('/api/admin/reminders', { method: 'PUT', body: JSON.stringify({ reminder_email }) }),
+  sendTestReminder: () => request<{ ok: boolean }>('/api/admin/reminders/test', { method: 'POST' }),
+}
+
+export function formatDay(iso: string | null): string {
+  if (!iso) return '—'
+  const [y, m, d] = iso.split('-').map(Number)
+  return new Date(y, m - 1, d).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+export function todayIso(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
 export function formatDate(iso: string | null): string {

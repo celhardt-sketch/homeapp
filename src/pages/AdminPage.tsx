@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Copy, KeyRound, Lock, LogOut, Nfc, Pencil, Plus, Trash2, X } from 'lucide-react'
-import { api, formatFrequency, setAdminToken, type Room, type RoomSummary, type Task } from '../api'
+import { Copy, KeyRound, Lock, LogOut, Mail, Nfc, Pencil, Plus, Trash2, X } from 'lucide-react'
+import { api, formatDay, formatFrequency, setAdminToken, type ReminderSettings, type Room, type RoomSummary, type Task } from '../api'
 import { ROOM_ICONS, RoomIcon } from '../icons'
 import { useAdminAuth } from '../useAdminAuth'
 
@@ -130,6 +130,8 @@ function AdminPanel({ onLogout }: { onLogout: () => void }) {
 
       {showPassword && <ChangePasswordForm onDone={() => setShowPassword(false)} />}
 
+      {!selected && <ReminderSettingsCard />}
+
       {!selected ? (
         <>
           <ul className="space-y-2">
@@ -179,6 +181,95 @@ function AdminPanel({ onLogout }: { onLogout: () => void }) {
         />
       )}
     </div>
+  )
+}
+
+function ReminderSettingsCard() {
+  const [settings, setSettings] = useState<ReminderSettings | null>(null)
+  const [email, setEmail] = useState('')
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  useEffect(() => {
+    api
+      .reminderSettings()
+      .then((s) => {
+        setSettings(s)
+        setEmail(s.reminder_email)
+      })
+      .catch((e: Error) => setMsg({ ok: false, text: e.message }))
+  }, [])
+
+  async function save() {
+    setMsg(null)
+    try {
+      setSettings(await api.saveReminderSettings(email))
+      setMsg({ ok: true, text: 'Saved.' })
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message })
+    }
+  }
+
+  async function sendTest() {
+    setMsg(null)
+    try {
+      if (settings && email !== settings.reminder_email) setSettings(await api.saveReminderSettings(email))
+      await api.sendTestReminder()
+      setMsg({ ok: true, text: `Test email sent to ${email}.` })
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message })
+    }
+  }
+
+  if (!settings) return null
+
+  return (
+    <section className="rounded-xl bg-white p-4 shadow-sm">
+      <h2 className="mb-1 flex items-center gap-2 font-medium">
+        <Mail className="size-5 text-teal-700" /> Medication reorder reminders
+      </h2>
+      <p className="mb-2 text-sm text-stone-500">
+        When a prescription hits its reorder date, an email goes to this address (checked hourly).
+      </p>
+      {!settings.email_configured && (
+        <p className="mb-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800">
+          Email sending isn't configured on the server yet (set RESEND_API_KEY or SMTP_HOST). Reminders still show in the
+          app.
+        </p>
+      )}
+      <div className="flex gap-2">
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="you@example.com"
+          className="flex-1 rounded-lg border border-stone-300 px-3 py-2 text-sm outline-none focus:border-teal-600"
+        />
+        <button
+          onClick={save}
+          disabled={email === settings.reminder_email}
+          className="rounded-lg bg-teal-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+        >
+          Save
+        </button>
+        <button
+          onClick={sendTest}
+          disabled={!email || !settings.email_configured}
+          className="rounded-lg border border-teal-700 px-3 py-2 text-sm font-medium text-teal-700 disabled:opacity-40"
+        >
+          Send test
+        </button>
+      </div>
+      {msg && (
+        <p className={`mt-2 rounded-lg p-2 text-sm ${msg.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
+          {msg.text}
+        </p>
+      )}
+      {settings.due.length > 0 && (
+        <p className="mt-2 text-xs text-stone-500">
+          Due now: {settings.due.map((d) => `${d.name} (${d.person}, ${formatDay(d.reorder_on)})`).join(', ')}
+        </p>
+      )}
+    </section>
   )
 }
 
