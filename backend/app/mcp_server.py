@@ -81,6 +81,7 @@ def build_mcp() -> FastMCP:
             mark_called,
             list_prescriptions,
             add_prescription,
+            remove,
             find,
         ],
     )
@@ -1393,6 +1394,64 @@ def list_for_person(
         }
 
     return _run(go)
+
+
+REMOVE_KINDS = ("task", "shopping", "upkeep", "declutter", "prescription", "child")
+
+
+def _resolve_shopping_item(conn, item: str) -> dict:
+    items = core.list_shopping_items(include_done=True)
+    res = resolve(item, items)
+    if isinstance(res, Match):
+        return res.item
+    if isinstance(res, Ambiguous):
+        raise _AmbiguousError(_disambiguation("shopping item", item, [_shopping_brief(c) for c in res.candidates]))
+    raise _no_match("shopping item", item, res.nearest)
+
+
+def remove(
+    kind: Annotated[str, Field(description="One of: task, shopping, upkeep, declutter, prescription, child.")],
+    item: Id,
+    child: Annotated[str | None, Field(description="For kind=prescription: whose it is, by name or id.")] = None,
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Delete something for good once it's finished, used up or no longer wanted: "delete the
+    'fix the gate' task", "take dish soap off the shopping list", "remove the hall closet from the
+    declutter list", "delete Ava's old amoxicillin prescription". For pantry use remove_pantry_item;
+    for rooms use archive_room. Deleting a prescription drops its pickup history too; a child with
+    prescriptions can't be deleted until those are."""
+
+    def go():
+        k = kind.strip().lower().rstrip("s") if kind else ""
+        k = {"shopping item": "shopping", "upkeep item": "upkeep", "declutter spot": "declutter", "kid": "child"}.get(k, k)
+        if k not in REMOVE_KINDS:
+            raise ToolError(f"I can remove one of: {', '.join(REMOVE_KINDS)}. Not '{kind}'.")
+        with get_conn() as conn:
+            if k == "task":
+                t = _resolve_task(conn, item)
+                label, delete = _task_brief(t), core.delete_task
+            elif k == "shopping":
+                s = _resolve_shopping_item(conn, item)
+                label, delete = _shopping_brief(s), core.delete_shopping_item
+            elif k == "upkeep":
+                u = _resolve_upkeep(conn, item)
+                label, delete = {"id": u["id"], "name": u["name"]}, core.delete_upkeep
+            elif k == "declutter":
+                d = _resolve_declutter(conn, item, include_done=True)
+                label, delete = _declutter_brief(d), core.delete_declutter
+            elif k == "prescription":
+                if not child:
+                    raise ToolError("Say whose prescription it is, e.g. child='Ava'.")
+                rx = _resolve_prescription(conn, child, item)
+                label, delete = _rx_brief(rx), core.delete_prescription
+            else:
+                c = _resolve_child(conn, item)
+                label, delete = {"id": c["id"], "name": c["name"]}, core.delete_child
+        delete(label["id"])
+        name = label.get("name") or label.get("item") or label.get("title")
+        return {"removed": True, "kind": k, "item": label, "message": f"Removed {name}."}
+
+    return _idempotent(idempotency_key, "remove", lambda: _run(go))
 
 
 def find(query: Annotated[str, Field(description="A word or two, e.g. 'filter', 'rice', 'bathroom'.")]) -> dict:

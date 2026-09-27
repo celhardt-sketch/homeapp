@@ -133,7 +133,15 @@ export default function RefillsPage({ isAdmin }: { isAdmin: boolean }) {
 
       <ul className="space-y-3">
         {sorted.map((p) => (
-          <PrescriptionCard key={p.id} rx={p} isAdmin={isAdmin} onChange={upsert} onEdit={() => setEditing(p)} onError={setError} />
+          <PrescriptionCard
+            key={p.id}
+            rx={p}
+            isAdmin={isAdmin}
+            onChange={upsert}
+            onEdit={() => setEditing(p)}
+            onDelete={() => setRxs((prev) => prev?.filter((x) => x.id !== p.id) ?? null)}
+            onError={setError}
+          />
         ))}
       </ul>
 
@@ -141,6 +149,39 @@ export default function RefillsPage({ isAdmin }: { isAdmin: boolean }) {
         <label className="flex items-center gap-2 text-xs text-stone-500">
           <input type="checkbox" checked={showInactive} onChange={(e) => setShowInactive(e.target.checked)} /> Show deactivated prescriptions
         </label>
+      )}
+
+      {isAdmin && children.length > 0 && (
+        <details className="rounded-xl bg-white p-4 text-sm shadow-sm">
+          <summary className="cursor-pointer font-medium">Children</summary>
+          <ul className="mt-2 divide-y divide-stone-100">
+            {children.map((c) => {
+              const count = rxs.filter((p) => p.child_id === c.id).length
+              return (
+                <li key={c.id} className="flex items-center justify-between py-2">
+                  <span>
+                    {c.name} <span className="text-xs text-stone-400">· {count} prescription{count === 1 ? '' : 's'}</span>
+                  </span>
+                  <button
+                    onClick={async () => {
+                      if (!confirm(`Delete ${c.name}? Sizes and needs for ${c.name} go too.`)) return
+                      try {
+                        await api.deleteChild(c.id)
+                        setChildren((prev) => prev.filter((k) => k.id !== c.id))
+                      } catch (e) {
+                        setError((e as Error).message)
+                      }
+                    }}
+                    className="p-1.5 text-stone-400 hover:text-red-700"
+                    aria-label={`Delete ${c.name}`}
+                  >
+                    <Trash2 className="size-4" />
+                  </button>
+                </li>
+              )
+            })}
+          </ul>
+        </details>
       )}
     </div>
   )
@@ -151,12 +192,14 @@ function PrescriptionCard({
   isAdmin,
   onChange,
   onEdit,
+  onDelete,
   onError,
 }: {
   rx: Prescription
   isAdmin: boolean
   onChange: (p: Prescription) => void
   onEdit: () => void
+  onDelete: () => void
   onError: (msg: string) => void
 }) {
   const [open, setOpen] = useState(false)
@@ -208,6 +251,16 @@ function PrescriptionCard({
     if (!active && !confirm(`Deactivate ${rx.name} for ${rx.child}? History is kept; it stops appearing on the refill list.`)) return
     try {
       onChange(await api.updatePrescription(rx.id, { active }))
+    } catch (e) {
+      onError((e as Error).message)
+    }
+  }
+
+  async function remove() {
+    if (!confirm(`Delete ${rx.name} for ${rx.child} for good? Its pickup history goes with it. (Deactivate instead to keep the history.)`)) return
+    try {
+      await api.deletePrescription(rx.id)
+      onDelete()
     } catch (e) {
       onError((e as Error).message)
     }
@@ -356,6 +409,9 @@ function PrescriptionCard({
                   Reactivate
                 </button>
               )}
+              <button onClick={remove} className="ml-auto flex items-center gap-1 text-stone-400 hover:text-red-700">
+                <Trash2 className="size-4" /> Delete
+              </button>
             </div>
           )}
         </div>

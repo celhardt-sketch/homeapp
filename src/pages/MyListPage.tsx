@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Check, ShoppingCart } from 'lucide-react'
+import { Check, ShoppingCart, Trash2 } from 'lucide-react'
 import { api, formatDay, formatFrequency, type ListItem, type PersonList, type User } from '../api'
 
 export default function MyListPage({ me }: { me: User }) {
@@ -26,6 +26,18 @@ export default function MyListPage({ me }: { me: User }) {
     try {
       if (item.kind === 'task') await api.completeTask(item.id)
       else await api.updateShoppingItem(item.id, { bought: true })
+      load()
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
+  async function remove(item: ListItem) {
+    if (!confirm(`Delete "${item.title}"?`)) return
+    setError(null)
+    try {
+      if (item.kind === 'task') await api.deleteTask(item.id)
+      else await api.deleteShoppingItem(item.id)
       load()
     } catch (e) {
       setError((e as Error).message)
@@ -107,6 +119,11 @@ export default function MyListPage({ me }: { me: User }) {
                     {item.done && item.last_completed_by && <> · done by {item.last_completed_by}</>}
                   </p>
                 </div>
+                {(mine || me.role === 'admin') && (
+                  <button onClick={() => remove(item)} className="p-1.5 text-stone-400 hover:text-red-600" aria-label={`Delete "${item.title}"`}>
+                    <Trash2 className="size-4" />
+                  </button>
+                )}
               </li>
             ))}
           </ul>
