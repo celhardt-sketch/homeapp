@@ -107,7 +107,11 @@ export default function RefillsPage({ isAdmin }: { isAdmin: boolean }) {
           rx={editing}
           kids={children}
           users={users}
-          onChildAdded={(c) => setChildren((prev) => [...prev, c].sort((a, b) => a.name.localeCompare(b.name)))}
+          onChildAdded={(c) =>
+            setChildren((prev) =>
+              prev.some((k) => k.id === c.id) ? prev : [...prev, c].sort((a, b) => a.name.localeCompare(b.name)),
+            )
+          }
           onSaved={(p) => {
             upsert(p)
             setShowForm(false)
@@ -402,7 +406,13 @@ function PrescriptionForm({
     e.preventDefault()
     if (!form.name.trim() || !form.child_id) return
     try {
-      onSaved(rx ? await api.updatePrescription(rx.id, form) : await api.createPrescription(form))
+      if (rx) {
+        onSaved(await api.updatePrescription(rx.id, form))
+        return
+      }
+      const created = await api.createPrescription(form)
+      if (created.duplicate) onError(`${created.child} already has "${created.name}", so nothing was added.`)
+      onSaved(created)
     } catch (err) {
       onError((err as Error).message)
     }

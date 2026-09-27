@@ -25,6 +25,8 @@ The server checks hourly for refills due (in-app notifications, daily) and upkee
 
 Without either, reminders are still shown in the app.
 
+Standing rules for all changes (name matching, persistent reminders, duplicates, idempotency, roles) live in [AGENTS.md](AGENTS.md).
+
 ## People, passwords and roles
 
 | | Member (e.g. Susan, Vanessa) | Admin (Courtney, Magnus) |
@@ -32,8 +34,9 @@ Without either, reminders are still shown in the app.
 | Tasks, completions, notes, upkeep, pantry, shopping, `/api/status`, everyone's lists | read + write (own items; can't reassign) | read + write |
 | Add / rename / archive / delete rooms | — (403) | yes (also the Claude connector) |
 | Refills: read, log pickups, mark called | yes | yes |
-| Add / edit / deactivate children and prescriptions | — (403) | yes |
-| Activity feed, people, `/api/admin/*` | — (403) | yes |
+| Add / edit / deactivate children and prescriptions | — (403) | yes (also the Claude connector) |
+| Activity feed | — (403) | yes (also the Claude connector) |
+| People, `/api/admin/*` | — (403) | yes (connector: 403) |
 | Session | 365 days, sliding (renewed on every request) | 30 days |
 
 Accounts are created on first start from `HOME_USERS` (default `Courtney:admin,Magnus:admin,Susan,Vanessa`) with a password per person from `PASSWORD_<NAME>` (e.g. `PASSWORD_SUSAN`). There are no default passwords: if a listed person has no account yet and no password variable, the server refuses to start and logs which variable is missing. Upgrading from the old shared passwords: admins inherit the stored admin password and members the stored household password, so nothing needs to be set. Everyone can change their own password from the Manage page; admins can add people, reset passwords and remove people. Changing someone's password logs out their devices only.

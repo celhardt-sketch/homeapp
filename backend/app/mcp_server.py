@@ -734,7 +734,7 @@ def add_prescription(
                 else []
             )
         if kid is None:
-            kid = core.create_child(core.ChildIn(name=child.strip()))
+            kid = core.create_child(core.ChildIn(name=child.strip()), Response())
         if existing:
             return {
                 "created": False,
@@ -751,7 +751,8 @@ def add_prescription(
                 contact_phone=contact_phone or "",
                 days_supply=days_supply or 30,
                 refill_after_days=refill_after_days or 28,
-            )
+            ),
+            Response(),
         )
         return {
             "created": True,

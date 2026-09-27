@@ -63,16 +63,15 @@ MANAGER_ONLY = [
     ("POST", "/api/rooms", {"name": "X"}),
     ("PATCH", "/api/rooms/1", {"icon": "home"}),
     ("DELETE", "/api/rooms/999999", None),
-]
-
-ADMIN_ONLY = [
     ("GET", "/api/activity", None),
-    # only admins add, edit or deactivate children and prescriptions (the connector too)
+    # helpers can't add, edit or deactivate children and prescriptions; admins and the connector can
     ("POST", "/api/children", {"name": "X"}),
     ("PATCH", "/api/children/1", {"name": "X"}),
     ("POST", "/api/prescriptions", {"child_id": 1, "name": "X"}),
     ("PATCH", "/api/prescriptions/1", {"name": "X"}),
-    # admin
+]
+
+ADMIN_ONLY = [
     ("POST", "/api/admin/users", {"name": "X", "password": "yyyyyyyy"}),
     ("PATCH", "/api/admin/users/1", {"email": ""}),
     ("DELETE", "/api/admin/users/1", None),
