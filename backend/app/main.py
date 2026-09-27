@@ -898,6 +898,14 @@ def update_note(note_id: int, body: NotePatch):
         return serialize_note(conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone())
 
 
+@app.delete("/api/notes/{note_id}", status_code=204, dependencies=MEMBER)
+def delete_note(note_id: int):
+    with get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM notes WHERE id = ?", (note_id,)).fetchone():
+            raise HTTPException(404, "Note not found")
+        conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+
+
 @app.get("/api/shopping", dependencies=MEMBER)
 def shopping_list():
     with get_conn() as conn:
@@ -1288,6 +1296,22 @@ def update_child(child_id: int, body: ChildPatch):
         return serialize_child(fetch_child_or_404(conn, child_id))
 
 
+@app.delete("/api/children/{child_id}", status_code=204, dependencies=MANAGER)
+def delete_child(child_id: int):
+    """Refused while the child still has prescriptions (their pickup history would go with them);
+    deactivate instead, or delete the prescriptions first."""
+    with get_conn() as conn:
+        c = fetch_child_or_404(conn, child_id)
+        n = conn.execute("SELECT COUNT(*) FROM prescriptions WHERE child_id = ?", (child_id,)).fetchone()[0]
+        if n:
+            raise HTTPException(
+                409,
+                f"{c['name']} still has {n} prescription{'s' if n != 1 else ''}. Delete those first, "
+                "or mark the child inactive to keep the history.",
+            )
+        conn.execute("DELETE FROM children WHERE id = ?", (child_id,))
+
+
 # ---------- Children's sizes and needs (every named user; Claude too) ----------
 
 
@@ -1380,6 +1404,14 @@ def update_need(need_id: int, body: NeedPatch, actor: Actor = ACTOR):
         return kids.fetch_need(conn, need_id)
 
 
+@app.delete("/api/needs/{need_id}", status_code=204, dependencies=MEMBER)
+def delete_need(need_id: int):
+    with get_conn() as conn:
+        if not kids.fetch_need(conn, need_id):
+            raise HTTPException(404, "Need not found")
+        conn.execute("DELETE FROM child_needs WHERE id = ?", (need_id,))
+
+
 @app.post("/api/needs/seasonal-check", dependencies=MEMBER)
 def seasonal_check(body: SeasonalCheckIn):
     """Every active child crossed with every category: current size (and its age) plus whether a
@@ -1463,6 +1495,14 @@ def update_prescription(rx_id: int, body: PrescriptionPatch):
             sets = ", ".join(f"{k} = ?" for k in fields)
             conn.execute(f"UPDATE prescriptions SET {sets} WHERE id = ?", (*fields.values(), rx_id))
         return refills.serialize_prescription(conn, fetch_prescription_or_404(conn, rx_id))
+
+
+@app.delete("/api/prescriptions/{rx_id}", status_code=204, dependencies=MANAGER)
+def delete_prescription(rx_id: int):
+    """Removes the prescription and its pickup history. Use PATCH active=false to keep the history."""
+    with get_conn() as conn:
+        fetch_prescription_or_404(conn, rx_id)
+        conn.execute("DELETE FROM prescriptions WHERE id = ?", (rx_id,))
 
 
 @app.post("/api/prescriptions/{rx_id}/pickups", status_code=201, dependencies=MEMBER)

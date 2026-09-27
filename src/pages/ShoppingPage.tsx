@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Check, Plus } from 'lucide-react'
+import { Check, Plus, Trash2 } from 'lucide-react'
 import { api, formatDate, formatDay, type PantryItem, type PurchaseNote, type ShoppingItem, type User } from '../api'
 
 export default function ShoppingPage({ userName, canAssign, myUserId }: { userName: string; canAssign: boolean; myUserId: number | null }) {
@@ -40,6 +40,24 @@ export default function ShoppingPage({ userName, canAssign, myUserId }: { userNa
     } catch (err) {
       setError((err as Error).message)
     }
+  }
+
+  async function removeItem(item: ShoppingItem) {
+    if (!confirm(`Delete "${item.name}"?`)) return
+    await api.deleteShoppingItem(item.id)
+    setStandalone((prev) => prev?.filter((i) => i.id !== item.id) ?? null)
+  }
+
+  async function removeNote(item: PurchaseNote) {
+    if (!confirm('Delete this note?')) return
+    await api.deleteNote(item.id)
+    setItems((prev) => prev?.filter((i) => i.id !== item.id) ?? null)
+  }
+
+  async function removePantry(item: PantryItem) {
+    if (!confirm(`Delete "${item.name}" from the pantry?`)) return
+    await api.deletePantryItem(item.id)
+    setPantry((prev) => prev?.filter((i) => i.id !== item.id) ?? null)
   }
 
   async function markStocked(item: PantryItem) {
@@ -108,6 +126,7 @@ export default function ShoppingPage({ userName, canAssign, myUserId }: { userNa
                     {item.added_by && <> · added by {item.added_by}</>}
                   </p>
                 </div>
+                <DeleteButton onClick={() => removeItem(item)} />
               </li>
             ))}
           </ul>
@@ -129,6 +148,7 @@ export default function ShoppingPage({ userName, canAssign, myUserId }: { userNa
                     {item.updated_by && <> · flagged by {item.updated_by}</>}
                   </p>
                 </div>
+                <DeleteButton onClick={() => removePantry(item)} />
               </li>
             ))}
           </ul>
@@ -149,12 +169,21 @@ export default function ShoppingPage({ userName, canAssign, myUserId }: { userNa
                     {item.room_name} · {item.author} · {formatDate(item.created_at)}
                   </p>
                 </div>
+                <DeleteButton onClick={() => removeNote(item)} />
               </li>
             ))}
           </ul>
         </section>
       )}
     </div>
+  )
+}
+
+function DeleteButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button onClick={onClick} className="p-1.5 text-stone-400 hover:text-red-600" aria-label="Delete">
+      <Trash2 className="size-4" />
+    </button>
   )
 }
 

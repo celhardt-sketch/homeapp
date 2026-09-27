@@ -410,6 +410,10 @@ export const api = {
   markCalled: (id: number, notes = '') =>
     request<Prescription>(`/api/prescriptions/${id}/called`, { method: 'POST', body: JSON.stringify({ notes }) }),
   deletePickup: (id: number) => request<void>(`/api/pickups/${id}`, { method: 'DELETE' }),
+  deletePrescription: (id: number) => request<void>(`/api/prescriptions/${id}`, { method: 'DELETE' }),
+  deleteChild: (id: number) => request<void>(`/api/children/${id}`, { method: 'DELETE' }),
+  deleteNote: (id: number) => request<void>(`/api/notes/${id}`, { method: 'DELETE' }),
+  deleteNeed: (id: number) => request<void>(`/api/needs/${id}`, { method: 'DELETE' }),
 
   upkeep: () => request<UpkeepItem[]>('/api/upkeep'),
   createUpkeep: (body: { name: string; category?: string; interval_days: number; notes?: string; last_done_on?: string | null }) =>

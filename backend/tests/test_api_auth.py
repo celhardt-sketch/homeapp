@@ -33,6 +33,8 @@ HOUSEHOLD_OK = [
     # notes
     ("POST", "/api/tasks/1/notes", {"author": "X", "body": "X"}),
     ("PATCH", "/api/notes/1", {"resolved": True}),
+    ("DELETE", "/api/notes/1", None),
+    ("DELETE", "/api/needs/1", None),
     # shopping
     ("GET", "/api/shopping", None),
     # pantry
@@ -74,6 +76,8 @@ MANAGER_ONLY = [
     ("PATCH", "/api/children/1", {"name": "X"}),
     ("POST", "/api/prescriptions", {"child_id": 1, "name": "X"}),
     ("PATCH", "/api/prescriptions/1", {"name": "X"}),
+    ("DELETE", "/api/prescriptions/1", None),
+    ("DELETE", "/api/children/1", None),
 ]
 
 ADMIN_ONLY = [

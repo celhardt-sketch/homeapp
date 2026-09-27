@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
-import { Check, ChevronDown, ChevronUp, History, ShoppingCart, StickyNote, Undo2 } from 'lucide-react'
+import { Check, ChevronDown, ChevronUp, History, ShoppingCart, StickyNote, Trash2, Undo2 } from 'lucide-react'
 import { api, formatDate, formatFrequency, type Completion, type Room, type Task } from '../api'
 import { RoomIcon } from '../icons'
 import StatusBadge from '../components/StatusBadge'
@@ -114,6 +114,13 @@ function TaskCard({
       onChange({ ...task, notes: task.notes.filter((n) => n.id !== id) })
     })
 
+  const deleteNote = (id: number) =>
+    run(async () => {
+      if (!confirm('Delete this note?')) return
+      await api.deleteNote(id)
+      onChange({ ...task, notes: task.notes.filter((n) => n.id !== id) })
+    })
+
   const toggleHistory = () =>
     run(async () => {
       if (history) setHistory(null)
@@ -194,6 +201,9 @@ function TaskCard({
                     className="text-xs text-teal-700 underline"
                   >
                     Resolve
+                  </button>
+                  <button onClick={() => deleteNote(n.id)} disabled={busy} className="p-0.5 text-stone-400 hover:text-red-600" aria-label="Delete note">
+                    <Trash2 className="size-3.5" />
                   </button>
                 </li>
               ))}
