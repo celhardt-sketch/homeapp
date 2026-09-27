@@ -417,7 +417,7 @@ export const api = {
 
   upkeep: () => request<UpkeepItem[]>('/api/upkeep'),
   createUpkeep: (body: { name: string; category?: string; interval_days: number; notes?: string; last_done_on?: string | null }) =>
-    request<UpkeepItem>('/api/upkeep', { method: 'POST', body: JSON.stringify(body) }),
+    request<UpkeepItem & { duplicate: boolean; duplicate_of?: string }>('/api/upkeep', { method: 'POST', body: JSON.stringify(body) }),
   updateUpkeep: (id: number, body: Partial<Pick<UpkeepItem, 'name' | 'category' | 'interval_days' | 'notes' | 'active'>>) =>
     request<UpkeepItem>(`/api/upkeep/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteUpkeep: (id: number) => request<void>(`/api/upkeep/${id}`, { method: 'DELETE' }),

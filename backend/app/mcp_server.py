@@ -58,6 +58,7 @@ def build_mcp() -> FastMCP:
             list_upkeep,
             log_upkeep_done,
             list_declutter,
+            add_upkeep_items,
             add_declutter_spots,
             declutter_done,
             list_pantry,
@@ -570,6 +571,85 @@ def log_upkeep_done(
         return {"logged": True, "item": fresh}
 
     return _idempotent(idempotency_key, "log_upkeep_done", lambda: _run(go))
+
+
+FREQUENCY_WORDS = {
+    "daily": 1, "day": 1, "every day": 1,
+    "weekly": 7, "week": 7, "every week": 7,
+    "biweekly": 14, "fortnightly": 14, "every two weeks": 14, "every 2 weeks": 14,
+    "monthly": 30, "month": 30, "every month": 30,
+    "quarterly": 90, "every 3 months": 90, "every three months": 90,
+    "twice a year": 180, "every 6 months": 180, "every six months": 180, "semiannual": 180, "semi-annual": 180,
+    "yearly": 365, "annually": 365, "annual": 365, "year": 365, "every year": 365,
+}
+
+
+def _frequency_to_days(freq: str | int) -> int:
+    """'weekly' -> 7, 'every 3 months' -> 90, '45 days' -> 45, 45 -> 45."""
+    if isinstance(freq, int):
+        return freq
+    f = " ".join(freq.strip().lower().replace("-", " ").split())
+    if f in FREQUENCY_WORDS:
+        return FREQUENCY_WORDS[f]
+    m = re.fullmatch(r"(?:every\s+)?(\d+)\s*(day|week|month|year)s?", f)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        return n * {"day": 1, "week": 7, "month": 30, "year": 365}[unit]
+    if f.isdigit():
+        return int(f)
+    raise ToolError(
+        f"I don't understand the frequency '{freq}'. Say daily, weekly, monthly, quarterly, yearly, "
+        "'every 6 months', or a number of days like '45 days'."
+    )
+
+
+class UpkeepItemSpec(core.BaseModel):
+    name: str = core.Field(min_length=1, max_length=120, description="e.g. 'Change furnace filter', 'Clean dryer vent'")
+    frequency: str | int = core.Field(
+        default="quarterly",
+        description="How often: daily, weekly, monthly, quarterly, yearly, 'every 6 months', or a number of days.",
+    )
+    category: str = core.Field(default="", max_length=60, description="e.g. HVAC, Car, Exterior, Safety, Appliances")
+    notes: str = core.Field(default="", max_length=500)
+    last_done_on: str | None = core.Field(default=None, description="When it was last done, YYYY-MM-DD, if known. Otherwise it counts as due now.")
+
+
+def add_upkeep_items(
+    items: Annotated[list[UpkeepItemSpec], Field(description="One entry per job; several at once is fine.")],
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Put recurring house jobs on the upkeep list, like "remind us to clean the dryer vent every 6
+    months" or "add checking the sump pump monthly". Frequency can be said in words (daily, weekly,
+    monthly, quarterly, yearly, every 6 months) or as days. Takes several at once. A job already on
+    the list under a similar name is returned as a duplicate instead of being added twice."""
+
+    def go():
+        if not items:
+            raise ToolError("Give me at least one job to add.")
+        out = []
+        with get_conn() as conn:
+            for s in items:
+                days = _frequency_to_days(s.frequency)
+                if not 1 <= days <= 3650:
+                    raise ToolError(f"'{s.name}': frequency must be between 1 day and 10 years, got {days} days.")
+                body = core.UpkeepItemIn(
+                    name=s.name,
+                    category=s.category,
+                    interval_days=days,
+                    notes=s.notes,
+                    last_done_on=_parse_date(s.last_done_on, "last_done_on"),
+                )
+                out.append(core._insert_upkeep(conn, body))
+        added = [o for o in out if not o["duplicate"]]
+        dups = [o for o in out if o["duplicate"]]
+        return {
+            "added": added,
+            "duplicates": dups,
+            "message": f"Added {len(added)} upkeep job{'s' if len(added) != 1 else ''}"
+            + (f"; {len(dups)} already on the list." if dups else "."),
+        }
+
+    return _idempotent(idempotency_key, "add_upkeep_items", lambda: _run(go))
 
 
 # ---------- declutter list ----------
