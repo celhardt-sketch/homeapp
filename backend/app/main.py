@@ -307,6 +307,20 @@ class UpkeepLogIn(BaseModel):
     note: str = Field(default="", max_length=500)
 
 
+class DeclutterIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    room_id: int | None = None
+    notes: str = Field(default="", max_length=500)
+
+
+class DeclutterPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    room_id: int | None = None
+    notes: str | None = Field(default=None, max_length=500)
+    done: bool | None = None
+    done_on: date | None = None
+
+
 class ReminderSettingsIn(BaseModel):
     reminder_email: str = Field(max_length=200)
     refill_detail_in_notifications: bool | None = None
@@ -1621,6 +1635,115 @@ def delete_upkeep_log(log_id: int):
         if not conn.execute("SELECT 1 FROM upkeep_logs WHERE id = ?", (log_id,)).fetchone():
             raise HTTPException(404, "Log entry not found")
         conn.execute("DELETE FROM upkeep_logs WHERE id = ?", (log_id,))
+
+
+# ---------- Declutter list (drawers, closets, boxes to go through; done once, can be reset) ----------
+
+
+def serialize_declutter(conn: sqlite3.Connection, s: sqlite3.Row) -> dict:
+    room = conn.execute("SELECT name FROM rooms WHERE id = ?", (s["room_id"],)).fetchone() if s["room_id"] else None
+    done_on = s["done_on"]
+    return {
+        "id": s["id"],
+        "name": s["name"],
+        "room_id": s["room_id"],
+        "room": room["name"] if room else None,
+        "notes": s["notes"],
+        "done": done_on is not None,
+        "done_on": done_on,
+        "done_by": s["done_by"] or None,
+        "days_since_done": (date.today() - date.fromisoformat(done_on)).days if done_on else None,
+        "created_at": s["created_at"],
+        "created_by": s["created_by"],
+    }
+
+
+def fetch_declutter_or_404(conn: sqlite3.Connection, spot_id: int) -> sqlite3.Row:
+    s = conn.execute("SELECT * FROM declutter_spots WHERE id = ?", (spot_id,)).fetchone()
+    if not s:
+        raise HTTPException(404, "Declutter spot not found")
+    return s
+
+
+def find_declutter_duplicate(conn: sqlite3.Connection, name: str, room_id: int | None) -> sqlite3.Row | None:
+    """Same-named spot in the same room ("junk drawer" in two rooms is two spots)."""
+    rows = [dict(r) for r in conn.execute("SELECT * FROM declutter_spots WHERE room_id IS ?", (room_id,))]
+    dup = _closest(name, rows)
+    return fetch_declutter_or_404(conn, dup["id"]) if dup else None
+
+
+def _insert_declutter(conn: sqlite3.Connection, body: DeclutterIn, actor: Actor) -> dict:
+    if body.room_id is not None:
+        fetch_room_or_404(conn, body.room_id)
+    name = " ".join(body.name.split())
+    dup = find_declutter_duplicate(conn, name, body.room_id)
+    if dup:
+        return {**serialize_declutter(conn, dup), "duplicate": True, "duplicate_of": dup["name"]}
+    cur = conn.execute(
+        "INSERT INTO declutter_spots (name, room_id, notes, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
+        (name, body.room_id, body.notes.strip(), now_iso(), actor.name),
+    )
+    return {**serialize_declutter(conn, fetch_declutter_or_404(conn, cur.lastrowid)), "duplicate": False}
+
+
+@app.get("/api/declutter", dependencies=MEMBER)
+def list_declutter(include_done: bool = False, room_id: int | None = None):
+    """Open spots first (oldest first), then done ones most recent first."""
+    with get_conn() as conn:
+        where, params = [], []
+        if not include_done:
+            where.append("done_on IS NULL")
+        if room_id is not None:
+            where.append("room_id = ?")
+            params.append(room_id)
+        sql = "SELECT * FROM declutter_spots" + (" WHERE " + " AND ".join(where) if where else "")
+        sql += " ORDER BY done_on IS NOT NULL, CASE WHEN done_on IS NULL THEN id END, done_on DESC, id DESC"
+        return [serialize_declutter(conn, s) for s in conn.execute(sql, params)]
+
+
+@app.post("/api/declutter", status_code=201, dependencies=MEMBER)
+def create_declutter(body: Union[DeclutterIn, list[DeclutterIn]], actor: Actor = ACTOR):
+    """One spot or a list of them in one transaction. A spot whose name closely matches an existing
+    one in the same room comes back flagged `duplicate` instead of being added twice."""
+    with get_conn() as conn:
+        if isinstance(body, list):
+            if not body:
+                raise HTTPException(422, "Empty list")
+            if len(body) > 200:
+                raise HTTPException(422, "Too many spots in one request")
+            return [_insert_declutter(conn, b, actor) for b in body]
+        return _insert_declutter(conn, body, actor)
+
+
+@app.patch("/api/declutter/{spot_id}", dependencies=MEMBER)
+def update_declutter(spot_id: int, body: DeclutterPatch, actor: Actor = ACTOR):
+    """`done: true` records who cleared it and when (today unless `done_on` given); `done: false`
+    puts it back on the list to do again."""
+    with get_conn() as conn:
+        fetch_declutter_or_404(conn, spot_id)
+        fields = body.model_dump(exclude_unset=True)
+        done = fields.pop("done", None)
+        done_on = fields.pop("done_on", None)
+        if fields.get("room_id") is not None:
+            fetch_room_or_404(conn, fields["room_id"])
+        for k in ("name", "notes"):
+            if k in fields and fields[k] is not None:
+                fields[k] = " ".join(fields[k].split())
+        if done is True:
+            fields.update(done_on=(done_on or date.today()).isoformat(), done_by=actor.name, user_id=actor.user_id)
+        elif done is False:
+            fields.update(done_on=None, done_by="", user_id=None)
+        if fields:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            conn.execute(f"UPDATE declutter_spots SET {sets} WHERE id = ?", (*fields.values(), spot_id))
+        return serialize_declutter(conn, fetch_declutter_or_404(conn, spot_id))
+
+
+@app.delete("/api/declutter/{spot_id}", status_code=204, dependencies=MEMBER)
+def delete_declutter(spot_id: int):
+    with get_conn() as conn:
+        fetch_declutter_or_404(conn, spot_id)
+        conn.execute("DELETE FROM declutter_spots WHERE id = ?", (spot_id,))
 
 
 # ---------- Reminder settings (admin) ----------

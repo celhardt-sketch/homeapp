@@ -40,7 +40,7 @@ def build_mcp() -> FastMCP:
     return FastMCP(
         name="Home",
         instructions=(
-            "Home maintenance, upkeep, pantry, shopping, the kids' sizes/needs and prescription refills "
+            "Home maintenance, upkeep, the declutter list, pantry, shopping, the kids' sizes/needs and prescription refills "
             "for one household. Refer to things by "
             "name; if a tool answers needs_disambiguation, ask the person which one they meant and "
             "call it again with the exact name or id."
@@ -57,6 +57,9 @@ def build_mcp() -> FastMCP:
             complete_task,
             list_upkeep,
             log_upkeep_done,
+            list_declutter,
+            add_declutter_spots,
+            declutter_done,
             list_pantry,
             add_pantry_items,
             update_pantry_item,
@@ -566,6 +569,118 @@ def log_upkeep_done(
         return {"logged": True, "item": fresh}
 
     return _idempotent(idempotency_key, "log_upkeep_done", lambda: _run(go))
+
+
+# ---------- declutter list ----------
+
+
+def _declutter_brief(s: dict) -> dict:
+    return {
+        "id": s["id"],
+        "name": s["name"],
+        "room": s["room"],
+        "notes": s["notes"],
+        "done": s["done"],
+        "done_on": s["done_on"],
+        "done_by": s["done_by"],
+        "days_since_done": s["days_since_done"],
+    }
+
+
+def _all_declutter(conn, include_done: bool = False) -> list[dict]:
+    return core.list_declutter(include_done=include_done)
+
+
+def _resolve_declutter(conn, spot: str, include_done: bool = False) -> dict:
+    spots = _all_declutter(conn, include_done)
+    labelled = [{**s, "label": f"{s['name']} ({s['room']})" if s["room"] else s["name"]} for s in spots]
+    res = resolve(spot, labelled, name_key="label")
+    if isinstance(res, Match):
+        return res.item
+    if isinstance(res, Ambiguous):
+        raise _AmbiguousError(_disambiguation("declutter spot", spot, [_declutter_brief(c) for c in res.candidates]))
+    raise _no_match("declutter spot", spot, [{"name": n["label"]} for n in res.nearest])
+
+
+def list_declutter(
+    room: Annotated[str | None, Field(description="Only spots in this room, by name or id.")] = None,
+    include_done: Annotated[bool, Field(description="Also show spots already cleared out, with who did it and when.")] = False,
+) -> dict:
+    """The declutter list: drawers, closets, shelves, boxes and corners that still need going through,
+    oldest first. For "what's left to declutter" or "what needs sorting in the girls' room"."""
+
+    def go():
+        with get_conn() as conn:
+            r = _resolve_room(conn, room) if room else None
+            spots = [s for s in _all_declutter(conn, include_done) if r is None or s["room_id"] == r["id"]]
+        open_ = [s for s in spots if not s["done"]]
+        return {
+            "spots": [_declutter_brief(s) for s in spots],
+            "open": len(open_),
+            "message": (
+                f"{len(open_)} spot{'s' if len(open_) != 1 else ''} left to declutter"
+                + (f" in the {r['name']}" if r else "")
+                + "."
+            ),
+        }
+
+    return _run(go)
+
+
+class DeclutterSpotSpec(core.BaseModel):
+    name: str = core.Field(min_length=1, max_length=120, description="e.g. 'Junk drawer', 'Hall closet top shelf', 'Boxes under the stairs'")
+    room: str | None = core.Field(default=None, description="Room it's in, by name or id, if any")
+    notes: str = core.Field(default="", max_length=500)
+
+
+def add_declutter_spots(
+    spots: Annotated[list[DeclutterSpotSpec], Field(description="One entry per drawer, closet, shelf or box; several at once is fine.")],
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Put places on the declutter list, like "add the junk drawer and the hall closet to the declutter
+    list". Takes several at once. A spot already on the list for that room is returned as a duplicate
+    instead of being added again."""
+
+    def go():
+        if not spots:
+            raise ToolError("Give me at least one spot to add.")
+        out = []
+        with get_conn() as conn:
+            for s in spots:
+                room_id = _resolve_room(conn, s.room)["id"] if s.room else None
+                out.append(core._insert_declutter(conn, core.DeclutterIn(name=s.name, room_id=room_id, notes=s.notes), _ACTOR))
+        added = [o for o in out if not o["duplicate"]]
+        dups = [o for o in out if o["duplicate"]]
+        return {
+            "added": [_declutter_brief(o) for o in added],
+            "duplicates": [{**_declutter_brief(o), "duplicate": True} for o in dups],
+            "message": f"Added {len(added)} spot{'s' if len(added) != 1 else ''} to the declutter list"
+            + (f"; {len(dups)} already there." if dups else "."),
+        }
+
+    return _idempotent(idempotency_key, "add_declutter_spots", lambda: _run(go))
+
+
+def declutter_done(
+    spot: Id,
+    done_on: Annotated[str | None, Field(description="Date it was done, YYYY-MM-DD. Defaults to today.")] = None,
+    done_by: Annotated[str | None, Field(description="Who cleared it out. Defaults to 'Claude'.")] = None,
+    notes: Annotated[str | None, Field(description="Anything to remember, e.g. 'donated two bags'.")] = None,
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Check a spot off the declutter list, like "I finished the junk drawer" or "Susan did the hall
+    closet yesterday". Records who and when. If the name fits several spots it asks which one."""
+
+    def go():
+        when = _parse_date(done_on, "done_on")
+        with get_conn() as conn:
+            s = _resolve_declutter(conn, spot)
+        actor = core.Actor(role=_ACTOR.role, name=done_by.strip()) if done_by and done_by.strip() else _ACTOR
+        patch = core.DeclutterPatch(done=True, done_on=when, **({"notes": notes} if notes is not None else {}))
+        fresh = core.update_declutter(s["id"], patch, actor=actor)
+        return {"done": True, "spot": _declutter_brief(fresh), "message": f"{fresh['name']} is done, by {fresh['done_by']} on {fresh['done_on']}."}
+
+    return _idempotent(idempotency_key, "declutter_done", lambda: _run(go))
 
 
 # ---------- prescription refills ----------
@@ -1281,7 +1396,7 @@ def list_for_person(
 
 
 def find(query: Annotated[str, Field(description="A word or two, e.g. 'filter', 'rice', 'bathroom'.")]) -> dict:
-    """Search everything at once - rooms, tasks, upkeep jobs, pantry items and the shopping list -
+    """Search everything at once - rooms, tasks, upkeep jobs, declutter spots, pantry items and the shopping list -
     for a name. Use it when you're not sure what something is called or where it lives."""
     with get_conn() as conn:
         rooms = [_room_brief(r) for r in _all_rooms(conn) if similarity(query, r["name"]) >= 0.55]
@@ -1291,15 +1406,17 @@ def find(query: Annotated[str, Field(description="A word or two, e.g. 'filter', 
             if similarity(query, t["title"]) >= 0.55 or similarity(query, f"{t['title']} {_task_room_label(t)}") >= 0.55
         ]
         upkeep = [i for i in _all_upkeep(conn) if similarity(query, i["name"]) >= 0.55 or similarity(query, i["category"]) >= 0.72]
+        declutter = [_declutter_brief(s) for s in _all_declutter(conn) if similarity(query, s["name"]) >= 0.55]
         pantry = [_pantry_brief(p) for p in _all_pantry(conn) if similarity(query, p["name"]) >= 0.55]
     shopping = [n for n in core.shopping_list() if similarity(query, n["body"]) >= 0.55]
     shopping_items = [_shopping_brief(s) for s in core.list_shopping_items() if similarity(query, s["name"]) >= 0.55]
-    total = len(rooms) + len(tasks) + len(upkeep) + len(pantry) + len(shopping) + len(shopping_items)
+    total = len(rooms) + len(tasks) + len(upkeep) + len(declutter) + len(pantry) + len(shopping) + len(shopping_items)
     return {
         "query": query,
         "rooms": rooms,
         "tasks": tasks,
         "upkeep": upkeep,
+        "declutter": declutter,
         "pantry": pantry,
         "shopping": [{"item": n["body"], "task": n["task_title"], "room": n["room_name"]} for n in shopping] + shopping_items,
         "message": f"Found {total} thing{'s' if total != 1 else ''} matching '{query}'." if total else f"Nothing matches '{query}'.",

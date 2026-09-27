@@ -27,6 +27,8 @@ EXPECTED_TOOLS = [
     "get_home_status", "list_rooms", "list_tasks", "add_task", "complete_task", "list_upkeep",
     "log_upkeep_done", "list_pantry", "add_pantry_items", "update_pantry_item", "remove_pantry_item",
     "list_shopping", "add_to_shopping", "find",
+    # declutter
+    "list_declutter", "add_declutter_spots", "declutter_done",
     # rooms
     "add_room", "rename_room", "archive_room",
     # lists and assignment
@@ -37,7 +39,7 @@ EXPECTED_TOOLS = [
     # prescriptions and refills
     "list_refills", "log_pickup", "mark_called", "list_prescriptions", "add_prescription",
 ]
-assert len(EXPECTED_TOOLS) == 32 == len(set(EXPECTED_TOOLS))
+assert len(EXPECTED_TOOLS) == 35 == len(set(EXPECTED_TOOLS))
 TOOLS = set(EXPECTED_TOOLS)
 
 
@@ -95,7 +97,7 @@ def test_handshake_lists_all_tools(server_url, client):
     missing, extra = TOOLS - set(tools), set(tools) - TOOLS
     assert not missing, f"tools/list is missing: {sorted(missing)}"
     assert not extra, f"tools/list has tools not in EXPECTED_TOOLS (add them there): {sorted(extra)}"
-    assert len(tools) == 32
+    assert len(tools) == 35
     assert all(tools[n] for n in TOOLS), "every tool needs a spoken-language description"
 
     # list_tasks takes an assignee filter and add_task an assignee argument
