@@ -2,12 +2,13 @@ import asyncio
 import logging
 import re
 import sqlite3
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from html import escape
@@ -27,7 +28,7 @@ async def lifespan(_: FastAPI):
     init_db()
     seed_if_empty()
     try:
-        auth.ensure_admin_credentials()
+        auth.ensure_users()
     except auth.MissingPasswordError as exc:
         log.critical("%s", exc)
         raise
@@ -39,7 +40,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Home Maintenance", lifespan=lifespan)
 
-PUBLIC_API_PATHS = frozenset({"/api/health", "/api/login"})
+PUBLIC_API_PATHS = frozenset({"/api/health", "/api/login", "/api/login/names"})
 SESSION_TOKEN_HEADER = "X-Session-Token"
 
 
@@ -47,21 +48,51 @@ SESSION_TOKEN_HEADER = "X-Session-Token"
 async def require_login_for_api(request: Request, call_next):
     """Deny-by-default: every /api route needs a valid session token unless allow-listed.
 
-    The role is stored on request.state for the per-route role dependencies. Household
-    sessions are sliding: a renewed token is returned on every request.
+    The role and user are stored on request.state for the per-route role dependencies.
+    Member sessions are sliding: a renewed token is returned on every request.
     """
     path = request.url.path.rstrip("/") or "/"
     request.state.role = None
+    request.state.user = None
     is_api = path == "/api" or path.startswith("/api/")
     if is_api and path not in PUBLIC_API_PATHS:
         try:
-            request.state.role = auth.authenticate(request.headers.get("authorization"))
+            request.state.role, request.state.user = auth.authenticate(request.headers.get("authorization"))
         except HTTPException as exc:
             return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
     response = await call_next(request)
-    if request.state.role == auth.HOUSEHOLD:
-        response.headers[SESSION_TOKEN_HEADER] = auth.issue_token(auth.HOUSEHOLD)
+    if request.state.role == auth.MEMBER and request.state.user is not None:
+        response.headers[SESSION_TOKEN_HEADER] = auth.issue_token(request.state.user)
     return response
+
+
+@dataclass(frozen=True)
+class Actor:
+    """Who is making a request: a named user (admin/member) or the connector (Claude)."""
+
+    role: str
+    user_id: int | None = None
+    name: str = ""
+
+    @property
+    def can_assign(self) -> bool:
+        return self.role in (auth.ADMIN, auth.CONNECTOR)
+
+    def attribution(self, fallback: str = "") -> str:
+        return self.name or fallback
+
+
+CONNECTOR_ACTOR = Actor(role=auth.CONNECTOR, name="Claude")
+
+
+def current_actor(request: Request) -> Actor:
+    u = request.state.user
+    if u is None:
+        return CONNECTOR_ACTOR
+    return Actor(role=request.state.role, user_id=u["id"], name=u["name"])
+
+
+ACTOR = Depends(current_actor)
 
 
 def now_iso() -> str:
@@ -80,6 +111,7 @@ class RoomIn(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     slug: str | None = Field(default=None, max_length=80)
     icon: str = "home"
+    sort_order: int | None = None
 
 
 class RoomPatch(BaseModel):
@@ -87,13 +119,16 @@ class RoomPatch(BaseModel):
     slug: str | None = Field(default=None, min_length=1, max_length=80)
     icon: str | None = None
     sort_order: int | None = None
+    active: bool | None = None
 
 
 class TaskIn(BaseModel):
-    room_id: int
+    room_id: int | None = None  # None = a standalone errand
     title: str = Field(min_length=1, max_length=120)
     description: str = ""
     frequency_days: int | None = Field(default=None, ge=1)
+    assignee_id: int | None = None
+    due_on: date | None = None
 
 
 class TaskPatch(BaseModel):
@@ -102,10 +137,28 @@ class TaskPatch(BaseModel):
     frequency_days: int | None = Field(default=None, ge=0)
     sort_order: int | None = None
     active: bool | None = None
+    assignee_id: int | None = None
+    due_on: date | None = None
 
 
 class CompleteIn(BaseModel):
-    completed_by: str = Field(min_length=1, max_length=60)
+    # Only used for the connector; a logged-in user's completion is attributed to them.
+    completed_by: str = Field(default="", max_length=60)
+
+
+class ShoppingItemIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    notes: str = Field(default="", max_length=500)
+    assignee_id: int | None = None
+    due_on: date | None = None
+
+
+class ShoppingItemPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    notes: str | None = Field(default=None, max_length=500)
+    assignee_id: int | None = None
+    due_on: date | None = None
+    bought: bool | None = None
 
 
 class NoteIn(BaseModel):
@@ -119,6 +172,7 @@ class NotePatch(BaseModel):
 
 
 class LoginIn(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
     password: str = Field(min_length=1, max_length=200)
 
 
@@ -127,8 +181,19 @@ class PasswordChangeIn(BaseModel):
     new_password: str = Field(min_length=4, max_length=200)
 
 
-class HouseholdPasswordIn(BaseModel):
-    new_password: str = Field(min_length=4, max_length=200)
+class UserIn(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    role: str = auth.MEMBER
+    password: str = Field(min_length=4, max_length=200)
+    email: str = Field(default="", max_length=200)
+
+
+class UserPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=60)
+    role: str | None = None
+    password: str | None = Field(default=None, min_length=4, max_length=200)
+    email: str | None = Field(default=None, max_length=200)
+    active: bool | None = None
 
 
 class PantryItemIn(BaseModel):
@@ -198,43 +263,116 @@ class ReminderSettingsIn(BaseModel):
 
 
 # Every /api route declares exactly one of these (enforced by tests/test_api_auth.py).
-HOUSEHOLD = [Depends(auth.need_household)]  # household or admin
-ADMIN = [Depends(auth.need_admin)]  # admin only -> 403 for household
+MEMBER = [Depends(auth.need_member)]  # any named user or the connector
+ADMIN = [Depends(auth.need_admin)]  # admin only -> 403 for members and the connector
+MANAGER = [Depends(auth.need_manager)]  # admin or connector -> 403 for members (room changes)
 
 
-# ---------- Auth ----------
+# ---------- Auth & users ----------
+
+
+@app.get("/api/login/names")
+def login_names():
+    """Who can log in (first names only) so the login screen can offer a picker."""
+    with get_conn() as conn:
+        return [r["name"] for r in conn.execute("SELECT name FROM users WHERE active = 1 ORDER BY id")]
 
 
 @app.post("/api/login")
 def login(body: LoginIn):
-    role = auth.role_for_password(body.password)
-    if role is None:
-        raise HTTPException(401, "Incorrect password")
-    return {"token": auth.issue_token(role), "role": role}
+    user = auth.login(body.name, body.password)
+    if user is None:
+        raise HTTPException(401, "Incorrect name or password")
+    return {"token": auth.issue_token(user), "role": user["role"], "user": auth.public_user(user)}
 
 
-@app.get("/api/session", dependencies=HOUSEHOLD)
+@app.get("/api/session", dependencies=MEMBER)
 def session(request: Request):
-    return {"role": request.state.role}
+    u = request.state.user
+    return {"role": request.state.role, "user": auth.public_user(u) if u is not None else None}
 
 
-@app.post("/api/admin/password", dependencies=ADMIN)
-def admin_change_password(body: PasswordChangeIn):
-    if not auth.check_password(auth.ADMIN, body.current_password):
+@app.post("/api/me/password", dependencies=MEMBER)
+def change_own_password(body: PasswordChangeIn, actor: Actor = ACTOR):
+    if actor.user_id is None:
+        raise HTTPException(403, "The connector has no password")
+    if not auth.check_user_password(actor.user_id, body.current_password):
         raise HTTPException(401, "Current password is incorrect")
-    auth.set_password(auth.ADMIN, body.new_password)
-    return {"token": auth.issue_token(auth.ADMIN)}
+    auth.set_user_password(actor.user_id, body.new_password)
+    with get_conn() as conn:
+        return {"token": auth.issue_token(auth.get_user(conn, actor.user_id))}
 
 
-@app.put("/api/admin/household-password", dependencies=ADMIN)
-def admin_set_household_password(body: HouseholdPasswordIn):
-    auth.set_password(auth.HOUSEHOLD, body.new_password)
-    return {"ok": True}
+@app.get("/api/users", dependencies=MEMBER)
+def list_users(include_inactive: bool = False):
+    with get_conn() as conn:
+        where = "" if include_inactive else "WHERE active = 1"
+        return [auth.public_user(r) for r in conn.execute(f"SELECT * FROM users {where} ORDER BY id")]
+
+
+def fetch_user_or_404(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row:
+    u = auth.get_user(conn, user_id)
+    if not u:
+        raise HTTPException(404, "Person not found")
+    return u
+
+
+def _check_role(role: str) -> str:
+    if role not in auth.USER_ROLES:
+        raise HTTPException(422, f"Role must be one of: {', '.join(auth.USER_ROLES)}")
+    return role
+
+
+@app.post("/api/admin/users", status_code=201, dependencies=ADMIN)
+def admin_create_user(body: UserIn):
+    with get_conn() as conn:
+        if auth.find_user_by_name(conn, body.name):
+            raise HTTPException(409, f"There is already someone called {body.name.strip()}")
+        cur = conn.execute(
+            "INSERT INTO users (name, role, password_hash, email, created_at) VALUES (?, ?, ?, ?, ?)",
+            (body.name.strip(), _check_role(body.role), auth.hash_password(body.password), body.email.strip(), now_iso()),
+        )
+        return auth.public_user(fetch_user_or_404(conn, cur.lastrowid))
+
+
+@app.patch("/api/admin/users/{user_id}", dependencies=ADMIN)
+def admin_update_user(user_id: int, body: UserPatch, actor: Actor = ACTOR):
+    with get_conn() as conn:
+        fetch_user_or_404(conn, user_id)
+        fields = body.model_dump(exclude_unset=True)
+        password = fields.pop("password", None)
+        if "name" in fields:
+            fields["name"] = fields["name"].strip()
+            dup = auth.find_user_by_name(conn, fields["name"])
+            if dup and dup["id"] != user_id:
+                raise HTTPException(409, f"There is already someone called {fields['name']}")
+        if "role" in fields:
+            _check_role(fields["role"])
+        if "active" in fields:
+            fields["active"] = int(fields["active"])
+        if user_id == actor.user_id and (fields.get("role") == auth.MEMBER or fields.get("active") == 0):
+            raise HTTPException(400, "You can't demote or deactivate yourself")
+        if fields:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            conn.execute(f"UPDATE users SET {sets} WHERE id = ?", (*fields.values(), user_id))
+    if password:
+        auth.set_user_password(user_id, password)
+    with get_conn() as conn:
+        return auth.public_user(fetch_user_or_404(conn, user_id))
+
+
+@app.delete("/api/admin/users/{user_id}", status_code=204, dependencies=ADMIN)
+def admin_delete_user(user_id: int, actor: Actor = ACTOR):
+    if user_id == actor.user_id:
+        raise HTTPException(400, "You can't delete yourself")
+    with get_conn() as conn:
+        fetch_user_or_404(conn, user_id)
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
 
 
 # ---------- MCP connector (Claude) ----------
 # The connector role only ever holds OAuth tokens minted by oauth.py; revoking them here
-# does not touch household or admin sessions.
+# does not touch anyone's sessions.
 
 
 @app.get("/api/admin/connector", dependencies=ADMIN)
@@ -284,7 +422,7 @@ def connector_approve(req: str = Form(), password: str = Form(default=""), decis
         return HTMLResponse("<p>This connection request has expired. Start again from Claude.</p>", status_code=410)
     if decision != "approve":
         return RedirectResponse(oauth.deny(req) or "/", status_code=303)
-    if not auth.check_password(auth.ADMIN, password):
+    if not auth.admin_for_password(password):
         return _approve_page(pending, req, "Incorrect admin password")
     return RedirectResponse(oauth.approve(req) or "/", status_code=303)
 
@@ -292,8 +430,11 @@ def connector_approve(req: str = Form(), password: str = Form(default=""), decis
 # ---------- Helpers ----------
 
 
-def task_status(last_completed_at: str | None, frequency_days: int | None) -> str:
+def task_status(last_completed_at: str | None, frequency_days: int | None, due_on: str | None = None) -> str:
     if frequency_days is None:
+        # a one-off errand: due on its date (if it has one) until it's done
+        if due_on and last_completed_at is None:
+            return "overdue" if date.fromisoformat(due_on) < date.today() else "due"
         return "ok"
     if last_completed_at is None:
         return "due"
@@ -306,29 +447,88 @@ def task_status(last_completed_at: str | None, frequency_days: int | None) -> st
     return "ok"
 
 
+def user_name(conn: sqlite3.Connection, user_id: int | None) -> str | None:
+    if user_id is None:
+        return None
+    row = conn.execute("SELECT name FROM users WHERE id = ?", (user_id,)).fetchone()
+    return row["name"] if row else None
+
+
 def serialize_task(conn: sqlite3.Connection, t: sqlite3.Row) -> dict:
     last = conn.execute(
-        "SELECT completed_by, completed_at FROM completions WHERE task_id = ? ORDER BY completed_at DESC LIMIT 1",
+        "SELECT completed_by, completed_at, user_id FROM completions WHERE task_id = ? ORDER BY completed_at DESC LIMIT 1",
         (t["id"],),
     ).fetchone()
     notes = conn.execute(
         "SELECT * FROM notes WHERE task_id = ? AND resolved = 0 ORDER BY created_at DESC",
         (t["id"],),
     ).fetchall()
+    room = conn.execute("SELECT name, slug FROM rooms WHERE id = ?", (t["room_id"],)).fetchone() if t["room_id"] else None
     last_at = last["completed_at"] if last else None
     return {
         "id": t["id"],
         "room_id": t["room_id"],
+        "room_name": room["name"] if room else None,
+        "room_slug": room["slug"] if room else None,
         "title": t["title"],
         "description": t["description"],
         "frequency_days": t["frequency_days"],
         "sort_order": t["sort_order"],
         "active": bool(t["active"]),
+        "assignee_id": t["assignee_id"],
+        "assignee": user_name(conn, t["assignee_id"]),
+        "due_on": t["due_on"],
+        "created_at": t["created_at"],
         "last_completed_at": last_at,
         "last_completed_by": last["completed_by"] if last else None,
-        "status": task_status(last_at, t["frequency_days"]),
+        "last_completed_by_user_id": last["user_id"] if last else None,
+        "status": task_status(last_at, t["frequency_days"], t["due_on"]),
+        # a room-less one-off is finished once it has been completed
+        "done": t["room_id"] is None and t["frequency_days"] is None and last_at is not None,
         "notes": [serialize_note(n) for n in notes],
     }
+
+
+def serialize_shopping_item(conn: sqlite3.Connection, s: sqlite3.Row) -> dict:
+    return {
+        "id": s["id"],
+        "name": s["name"],
+        "notes": s["notes"],
+        "assignee_id": s["assignee_id"],
+        "assignee": user_name(conn, s["assignee_id"]),
+        "due_on": s["due_on"],
+        "added_by": s["added_by"],
+        "created_at": s["created_at"],
+        "bought_at": s["bought_at"],
+        "bought_by": s["bought_by"],
+        "done": s["bought_at"] is not None,
+        "overdue": s["bought_at"] is None and s["due_on"] is not None and date.fromisoformat(s["due_on"]) < date.today(),
+    }
+
+
+def check_assignment(conn: sqlite3.Connection, actor: Actor, assignee_id: int | None, current: int | None = None) -> None:
+    """Admins and the connector can assign to anyone; a member may only put things on their own list."""
+    if assignee_id == current:
+        return
+    if assignee_id is not None:
+        fetch_user_or_404(conn, assignee_id)
+    if actor.can_assign:
+        return
+    if current is None and assignee_id == actor.user_id:
+        return
+    raise HTTPException(403, "Only an admin (or Claude) can assign things to other people")
+
+
+def notify_assignment(conn: sqlite3.Connection, actor: Actor, assignee_id: int | None, kind: str, ref_id: int, what: str) -> None:
+    """One notification per assignment. Nothing when unassigned or assigned to yourself."""
+    if assignee_id is None or assignee_id == actor.user_id:
+        return
+    by = actor.attribution("Someone")
+    noun = "a task" if kind == "task" else "something to buy"
+    conn.execute(
+        "INSERT INTO notifications (user_id, kind, ref_id, message, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (assignee_id, kind, ref_id, f"{by} put {noun} on your list: {what}", by, now_iso()),
+    )
 
 
 def serialize_note(n: sqlite3.Row) -> dict:
@@ -355,6 +555,7 @@ def serialize_room(conn: sqlite3.Connection, r: sqlite3.Row, with_tasks: bool) -
         "name": r["name"],
         "icon": r["icon"],
         "sort_order": r["sort_order"],
+        "active": bool(r["active"]),
         "task_count": len(serialized),
         "due_count": sum(1 for t in serialized if t["status"] != "ok"),
         "note_count": sum(len(t["notes"]) for t in serialized),
@@ -362,6 +563,13 @@ def serialize_room(conn: sqlite3.Connection, r: sqlite3.Row, with_tasks: bool) -
     if with_tasks:
         out["tasks"] = serialized
     return out
+
+
+# Active tasks that aren't in an archived room (room-less errands included).
+ACTIVE_TASKS_SQL = (
+    "SELECT t.* FROM tasks t LEFT JOIN rooms r ON r.id = t.room_id "
+    "WHERE t.active = 1 AND (t.room_id IS NULL OR r.active = 1) ORDER BY t.sort_order, t.id"
+)
 
 
 def fetch_room_or_404(conn: sqlite3.Connection, room_id: int) -> sqlite3.Row:
@@ -379,86 +587,168 @@ def fetch_task_or_404(conn: sqlite3.Connection, task_id: int) -> sqlite3.Row:
 
 
 # ---------- Rooms ----------
+# Changing rooms is admin/connector only (MANAGER); reading is open to everyone logged in.
 
 
-@app.get("/api/rooms", dependencies=HOUSEHOLD)
-def list_rooms():
+def _norm_room_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", "", name.lower().replace("'", "")).replace(" room", "").strip()
+
+
+def find_similar_room(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    """An existing room whose name is the same or nearly so ("dining room" vs "Dining Room",
+    "Kitchen" vs "Kitchn"). Only active rooms count."""
+    target = _norm_room_name(name)
+    if not target:
+        return None
+    best, best_score = None, 0.0
+    for r in conn.execute("SELECT * FROM rooms WHERE active = 1"):
+        existing = _norm_room_name(r["name"])
+        if existing == target or slugify(r["name"]) == slugify(name):
+            return r
+        score = SequenceMatcher(None, existing, target).ratio()
+        if score > best_score:
+            best, best_score = r, score
+    return best if best_score >= 0.88 else None
+
+
+def resolve_room_slug(conn: sqlite3.Connection, slug: str) -> sqlite3.Row | None:
+    """Current slug first, then old slugs left behind by renames (NFC tags on the wall)."""
+    r = conn.execute("SELECT * FROM rooms WHERE slug = ?", (slug,)).fetchone()
+    if r:
+        return r
+    return conn.execute(
+        "SELECT r.* FROM room_slug_aliases a JOIN rooms r ON r.id = a.room_id WHERE a.slug = ?", (slug,)
+    ).fetchone()
+
+
+def _unique_slug(conn: sqlite3.Connection, base: str, room_id: int | None = None) -> str:
+    slug, n = base, 2
+    while True:
+        taken = conn.execute(
+            "SELECT id FROM rooms WHERE slug = ? UNION SELECT room_id FROM room_slug_aliases WHERE slug = ?", (slug, slug)
+        ).fetchall()
+        if not taken or all(t[0] == room_id for t in taken):
+            return slug
+        slug, n = f"{base}-{n}", n + 1
+
+
+@app.get("/api/rooms", dependencies=MEMBER)
+def list_rooms(include_archived: bool = False):
     with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM rooms ORDER BY sort_order, id").fetchall()
+        where = "" if include_archived else "WHERE active = 1"
+        rows = conn.execute(f"SELECT * FROM rooms {where} ORDER BY sort_order, id").fetchall()
         return [serialize_room(conn, r, with_tasks=False) for r in rows]
 
 
-@app.post("/api/rooms", status_code=201, dependencies=HOUSEHOLD)
-def create_room(body: RoomIn):
-    slug = slugify(body.slug or body.name)
+@app.post("/api/rooms", status_code=201, dependencies=MANAGER)
+def create_room(body: RoomIn, response: Response):
+    """Creates a room. If one with (nearly) the same name exists, returns that one flagged as
+    a duplicate (200) instead of creating a second."""
+    name = body.name.strip()
     with get_conn() as conn:
-        if conn.execute("SELECT 1 FROM rooms WHERE slug = ?", (slug,)).fetchone():
-            raise HTTPException(409, f"A room with the tag id '{slug}' already exists")
+        existing = find_similar_room(conn, name)
+        if existing:
+            response.status_code = 200
+            return {**serialize_room(conn, existing, with_tasks=True), "duplicate": True, "duplicate_of": existing["name"]}
+        slug = _unique_slug(conn, slugify(body.slug or name))
         max_order = conn.execute("SELECT COALESCE(MAX(sort_order), -1) FROM rooms").fetchone()[0]
         cur = conn.execute(
             "INSERT INTO rooms (slug, name, icon, sort_order) VALUES (?, ?, ?, ?)",
-            (slug, body.name.strip(), body.icon, max_order + 1),
+            (slug, name, body.icon, body.sort_order if body.sort_order is not None else max_order + 1),
         )
-        return serialize_room(conn, fetch_room_or_404(conn, cur.lastrowid), with_tasks=True)
+        return {**serialize_room(conn, fetch_room_or_404(conn, cur.lastrowid), with_tasks=True), "duplicate": False}
 
 
-@app.get("/api/rooms/{slug}", dependencies=HOUSEHOLD)
+@app.get("/api/rooms/{slug}", dependencies=MEMBER)
 def get_room(slug: str):
+    """By current slug or an old one (tags written before a rename). Archived rooms still load
+    so their history stays reachable."""
     with get_conn() as conn:
-        r = conn.execute("SELECT * FROM rooms WHERE slug = ?", (slug,)).fetchone()
+        r = resolve_room_slug(conn, slug)
         if not r:
             raise HTTPException(404, "Room not found")
         return serialize_room(conn, r, with_tasks=True)
 
 
-@app.patch("/api/rooms/{room_id}", dependencies=HOUSEHOLD)
+@app.patch("/api/rooms/{room_id}", dependencies=MANAGER)
 def update_room(room_id: int, body: RoomPatch):
+    """Renaming regenerates the slug; the old slug is kept as an alias so existing NFC tags
+    still open the room. Same id, same task history."""
     with get_conn() as conn:
-        fetch_room_or_404(conn, room_id)
+        room = fetch_room_or_404(conn, room_id)
         fields = body.model_dump(exclude_none=True)
-        if "slug" in fields:
-            fields["slug"] = slugify(fields["slug"])
-            dup = conn.execute(
-                "SELECT 1 FROM rooms WHERE slug = ? AND id != ?", (fields["slug"], room_id)
-            ).fetchone()
-            if dup:
-                raise HTTPException(409, "That tag id is already in use")
         if "name" in fields:
             fields["name"] = fields["name"].strip()
+            if fields["name"] != room["name"]:
+                dup = find_similar_room(conn, fields["name"])
+                if dup and dup["id"] != room_id:
+                    raise HTTPException(409, f"There is already a room called {dup['name']}")
+                fields.setdefault("slug", fields["name"])
+        if "slug" in fields:
+            new_slug = _unique_slug(conn, slugify(fields["slug"]), room_id)
+            if new_slug != room["slug"]:
+                conn.execute(
+                    "INSERT OR REPLACE INTO room_slug_aliases (slug, room_id) VALUES (?, ?)", (room["slug"], room_id)
+                )
+                conn.execute("DELETE FROM room_slug_aliases WHERE slug = ?", (new_slug,))
+            fields["slug"] = new_slug
+        if "active" in fields:
+            fields["active"] = int(fields["active"])
         if fields:
             sets = ", ".join(f"{k} = ?" for k in fields)
             conn.execute(f"UPDATE rooms SET {sets} WHERE id = ?", (*fields.values(), room_id))
         return serialize_room(conn, fetch_room_or_404(conn, room_id), with_tasks=True)
 
 
-@app.delete("/api/rooms/{room_id}", status_code=204, dependencies=ADMIN)
+@app.delete("/api/rooms/{room_id}", status_code=204, dependencies=MANAGER)
 def delete_room(room_id: int):
+    """Refused while the room still has tasks (deleting would erase their history); archive instead."""
     with get_conn() as conn:
-        fetch_room_or_404(conn, room_id)
+        room = fetch_room_or_404(conn, room_id)
+        n = conn.execute("SELECT COUNT(*) FROM tasks WHERE room_id = ?", (room_id,)).fetchone()[0]
+        if n:
+            raise HTTPException(
+                409,
+                f"{room['name']} still has {n} task{'s' if n != 1 else ''} (and their history). "
+                "Deactivate the room instead of deleting it, or move/delete its tasks first.",
+            )
         conn.execute("DELETE FROM rooms WHERE id = ?", (room_id,))
 
 
 # ---------- Tasks ----------
 
 
-@app.post("/api/tasks", status_code=201, dependencies=HOUSEHOLD)
-def create_task(body: TaskIn):
+@app.post("/api/tasks", status_code=201, dependencies=MEMBER)
+def create_task(body: TaskIn, actor: Actor = ACTOR):
     with get_conn() as conn:
-        fetch_room_or_404(conn, body.room_id)
+        if body.room_id is not None:
+            fetch_room_or_404(conn, body.room_id)
+        check_assignment(conn, actor, body.assignee_id)
         max_order = conn.execute(
-            "SELECT COALESCE(MAX(sort_order), -1) FROM tasks WHERE room_id = ?", (body.room_id,)
+            "SELECT COALESCE(MAX(sort_order), -1) FROM tasks WHERE room_id IS ?", (body.room_id,)
         ).fetchone()[0]
         cur = conn.execute(
-            "INSERT INTO tasks (room_id, title, description, frequency_days, sort_order) VALUES (?, ?, ?, ?, ?)",
-            (body.room_id, body.title.strip(), body.description.strip(), body.frequency_days, max_order + 1),
+            "INSERT INTO tasks (room_id, title, description, frequency_days, sort_order, assignee_id, due_on, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                body.room_id,
+                body.title.strip(),
+                body.description.strip(),
+                body.frequency_days,
+                max_order + 1,
+                body.assignee_id,
+                body.due_on.isoformat() if body.due_on else None,
+                now_iso(),
+            ),
         )
+        notify_assignment(conn, actor, body.assignee_id, "task", cur.lastrowid, body.title.strip())
         return serialize_task(conn, fetch_task_or_404(conn, cur.lastrowid))
 
 
-@app.patch("/api/tasks/{task_id}", dependencies=HOUSEHOLD)
-def update_task(task_id: int, body: TaskPatch):
+@app.patch("/api/tasks/{task_id}", dependencies=MEMBER)
+def update_task(task_id: int, body: TaskPatch, actor: Actor = ACTOR):
     with get_conn() as conn:
-        fetch_task_or_404(conn, task_id)
+        t = fetch_task_or_404(conn, task_id)
         fields = body.model_dump(exclude_unset=True)
         if "frequency_days" in fields and not fields["frequency_days"]:
             fields["frequency_days"] = None
@@ -466,31 +756,40 @@ def update_task(task_id: int, body: TaskPatch):
             fields["active"] = int(fields["active"])
         if "title" in fields and fields["title"]:
             fields["title"] = fields["title"].strip()
+        if "due_on" in fields and fields["due_on"] is not None:
+            fields["due_on"] = fields["due_on"].isoformat()
+        reassigned = "assignee_id" in fields and fields["assignee_id"] != t["assignee_id"]
+        if reassigned:
+            check_assignment(conn, actor, fields["assignee_id"], t["assignee_id"])
         if fields:
             sets = ", ".join(f"{k} = ?" for k in fields)
             conn.execute(f"UPDATE tasks SET {sets} WHERE id = ?", (*fields.values(), task_id))
+        if reassigned:
+            notify_assignment(conn, actor, fields["assignee_id"], "task", task_id, fields.get("title") or t["title"])
         return serialize_task(conn, fetch_task_or_404(conn, task_id))
 
 
-@app.delete("/api/tasks/{task_id}", status_code=204, dependencies=HOUSEHOLD)
+@app.delete("/api/tasks/{task_id}", status_code=204, dependencies=MEMBER)
 def delete_task(task_id: int):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
 
 
-@app.post("/api/tasks/{task_id}/complete", status_code=201, dependencies=HOUSEHOLD)
-def complete_task(task_id: int, body: CompleteIn):
+@app.post("/api/tasks/{task_id}/complete", status_code=201, dependencies=MEMBER)
+def complete_task(task_id: int, body: CompleteIn, actor: Actor = ACTOR):
+    """A logged-in user's completion is always recorded under their own name."""
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
+        by = actor.name if actor.user_id else (body.completed_by.strip() or actor.name)
         conn.execute(
-            "INSERT INTO completions (task_id, completed_by, completed_at) VALUES (?, ?, ?)",
-            (task_id, body.completed_by.strip(), now_iso()),
+            "INSERT INTO completions (task_id, completed_by, completed_at, user_id) VALUES (?, ?, ?, ?)",
+            (task_id, by, now_iso(), actor.user_id),
         )
         return serialize_task(conn, fetch_task_or_404(conn, task_id))
 
 
-@app.delete("/api/completions/{completion_id}", status_code=204, dependencies=HOUSEHOLD)
+@app.delete("/api/completions/{completion_id}", status_code=204, dependencies=MEMBER)
 def undo_completion(completion_id: int):
     with get_conn() as conn:
         c = conn.execute("SELECT * FROM completions WHERE id = ?", (completion_id,)).fetchone()
@@ -499,12 +798,12 @@ def undo_completion(completion_id: int):
         conn.execute("DELETE FROM completions WHERE id = ?", (completion_id,))
 
 
-@app.get("/api/tasks/{task_id}/history", dependencies=HOUSEHOLD)
+@app.get("/api/tasks/{task_id}/history", dependencies=MEMBER)
 def task_history(task_id: int, limit: int = 50):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
         rows = conn.execute(
-            "SELECT id, completed_by, completed_at FROM completions WHERE task_id = ? ORDER BY completed_at DESC LIMIT ?",
+            "SELECT id, completed_by, completed_at, user_id FROM completions WHERE task_id = ? ORDER BY completed_at DESC LIMIT ?",
             (task_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -513,7 +812,7 @@ def task_history(task_id: int, limit: int = 50):
 # ---------- Notes ----------
 
 
-@app.post("/api/tasks/{task_id}/notes", status_code=201, dependencies=HOUSEHOLD)
+@app.post("/api/tasks/{task_id}/notes", status_code=201, dependencies=MEMBER)
 def add_note(task_id: int, body: NoteIn):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
@@ -525,7 +824,7 @@ def add_note(task_id: int, body: NoteIn):
         return serialize_note(n)
 
 
-@app.patch("/api/notes/{note_id}", dependencies=HOUSEHOLD)
+@app.patch("/api/notes/{note_id}", dependencies=MEMBER)
 def update_note(note_id: int, body: NotePatch):
     with get_conn() as conn:
         n = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
@@ -535,7 +834,7 @@ def update_note(note_id: int, body: NotePatch):
         return serialize_note(conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone())
 
 
-@app.get("/api/shopping", dependencies=HOUSEHOLD)
+@app.get("/api/shopping", dependencies=MEMBER)
 def shopping_list():
     with get_conn() as conn:
         rows = conn.execute(
@@ -543,7 +842,7 @@ def shopping_list():
             SELECT n.*, t.title AS task_title, r.name AS room_name, r.slug AS room_slug
             FROM notes n
             JOIN tasks t ON t.id = n.task_id
-            JOIN rooms r ON r.id = t.room_id
+            LEFT JOIN rooms r ON r.id = t.room_id
             WHERE n.needs_purchase = 1 AND n.resolved = 0
             ORDER BY n.created_at DESC
             """
@@ -559,15 +858,171 @@ def recent_activity(limit: int = 30):
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT c.id, c.completed_by, c.completed_at, t.title AS task_title, r.name AS room_name, r.slug AS room_slug
+            SELECT c.id, c.completed_by, c.completed_at, c.user_id, t.title AS task_title, r.name AS room_name, r.slug AS room_slug
             FROM completions c
             JOIN tasks t ON t.id = c.task_id
-            JOIN rooms r ON r.id = t.room_id
+            LEFT JOIN rooms r ON r.id = t.room_id
             ORDER BY c.completed_at DESC LIMIT ?
             """,
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ---------- Shopping items (standalone, assignable) ----------
+
+
+def fetch_shopping_or_404(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row:
+    s = conn.execute("SELECT * FROM shopping_items WHERE id = ?", (item_id,)).fetchone()
+    if not s:
+        raise HTTPException(404, "Shopping item not found")
+    return s
+
+
+@app.get("/api/shopping-items", dependencies=MEMBER)
+def list_shopping_items(include_done: bool = False):
+    with get_conn() as conn:
+        where = "" if include_done else "WHERE bought_at IS NULL"
+        rows = conn.execute(f"SELECT * FROM shopping_items {where} ORDER BY created_at, id").fetchall()
+        return [serialize_shopping_item(conn, s) for s in rows]
+
+
+@app.post("/api/shopping-items", status_code=201, dependencies=MEMBER)
+def create_shopping_item(body: ShoppingItemIn, actor: Actor = ACTOR):
+    with get_conn() as conn:
+        check_assignment(conn, actor, body.assignee_id)
+        cur = conn.execute(
+            "INSERT INTO shopping_items (name, notes, assignee_id, due_on, added_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (body.name.strip(), body.notes.strip(), body.assignee_id, body.due_on.isoformat() if body.due_on else None, actor.name, now_iso()),
+        )
+        notify_assignment(conn, actor, body.assignee_id, "shopping", cur.lastrowid, body.name.strip())
+        return serialize_shopping_item(conn, fetch_shopping_or_404(conn, cur.lastrowid))
+
+
+@app.patch("/api/shopping-items/{item_id}", dependencies=MEMBER)
+def update_shopping_item(item_id: int, body: ShoppingItemPatch, actor: Actor = ACTOR):
+    with get_conn() as conn:
+        s = fetch_shopping_or_404(conn, item_id)
+        fields = body.model_dump(exclude_unset=True)
+        bought = fields.pop("bought", None)
+        if bought is not None:
+            fields["bought_at"] = now_iso() if bought else None
+            fields["bought_by"] = actor.name if bought else ""
+        for k in ("name", "notes"):
+            if fields.get(k) is not None:
+                fields[k] = fields[k].strip()
+        if fields.get("due_on") is not None:
+            fields["due_on"] = fields["due_on"].isoformat()
+        reassigned = "assignee_id" in fields and fields["assignee_id"] != s["assignee_id"]
+        if reassigned:
+            check_assignment(conn, actor, fields["assignee_id"], s["assignee_id"])
+        if fields:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            conn.execute(f"UPDATE shopping_items SET {sets} WHERE id = ?", (*fields.values(), item_id))
+        if reassigned:
+            notify_assignment(conn, actor, fields["assignee_id"], "shopping", item_id, fields.get("name") or s["name"])
+        return serialize_shopping_item(conn, fetch_shopping_or_404(conn, item_id))
+
+
+@app.delete("/api/shopping-items/{item_id}", status_code=204, dependencies=MEMBER)
+def delete_shopping_item(item_id: int):
+    with get_conn() as conn:
+        fetch_shopping_or_404(conn, item_id)
+        conn.execute("DELETE FROM shopping_items WHERE id = ?", (item_id,))
+
+
+# ---------- Per-person lists & notifications ----------
+
+
+def person_list(conn: sqlite3.Connection, user: sqlite3.Row, include_done: bool = False) -> dict:
+    """Everything assigned to one person - tasks and shopping together - oldest first."""
+    items = []
+    for row in conn.execute("SELECT * FROM tasks WHERE assignee_id = ? AND active = 1", (user["id"],)):
+        t = serialize_task(conn, row)
+        if t["done"] and not include_done:
+            continue
+        items.append(
+            {
+                "kind": "task",
+                "id": t["id"],
+                "title": t["title"],
+                "notes": t["description"],
+                "room_name": t["room_name"],
+                "room_slug": t["room_slug"],
+                "due_on": t["due_on"],
+                "frequency_days": t["frequency_days"],
+                "status": t["status"],
+                "overdue": t["status"] == "overdue",
+                "done": t["done"],
+                "created_at": t["created_at"],
+                "last_completed_at": t["last_completed_at"],
+                "last_completed_by": t["last_completed_by"],
+            }
+        )
+    for row in conn.execute("SELECT * FROM shopping_items WHERE assignee_id = ?", (user["id"],)):
+        s = serialize_shopping_item(conn, row)
+        if s["done"] and not include_done:
+            continue
+        items.append(
+            {
+                "kind": "shopping",
+                "id": s["id"],
+                "title": s["name"],
+                "notes": s["notes"],
+                "room_name": None,
+                "room_slug": None,
+                "due_on": s["due_on"],
+                "frequency_days": None,
+                "status": "overdue" if s["overdue"] else "ok",
+                "overdue": s["overdue"],
+                "done": s["done"],
+                "created_at": s["created_at"],
+                "last_completed_at": s["bought_at"],
+                "last_completed_by": s["bought_by"] or None,
+            }
+        )
+    items.sort(key=lambda i: (i["created_at"], i["kind"], i["id"]))
+    return {
+        "user": auth.public_user(user),
+        "items": items,
+        "overdue_count": sum(1 for i in items if i["overdue"] and not i["done"]),
+    }
+
+
+@app.get("/api/users/{user_id}/list", dependencies=MEMBER)
+def user_list(user_id: int, include_done: bool = False):
+    with get_conn() as conn:
+        return person_list(conn, fetch_user_or_404(conn, user_id), include_done)
+
+
+@app.get("/api/me/list", dependencies=MEMBER)
+def my_list(include_done: bool = False, actor: Actor = ACTOR):
+    if actor.user_id is None:
+        raise HTTPException(403, "The connector has no list of its own; use /api/users/{id}/list")
+    with get_conn() as conn:
+        return person_list(conn, fetch_user_or_404(conn, actor.user_id), include_done)
+
+
+@app.get("/api/me/notifications", dependencies=MEMBER)
+def my_notifications(unread_only: bool = False, limit: int = 50, actor: Actor = ACTOR):
+    if actor.user_id is None:
+        return []
+    with get_conn() as conn:
+        where = "AND read_at IS NULL" if unread_only else ""
+        rows = conn.execute(
+            f"SELECT * FROM notifications WHERE user_id = ? {where} ORDER BY created_at DESC, id DESC LIMIT ?",
+            (actor.user_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+@app.post("/api/me/notifications/read", dependencies=MEMBER)
+def mark_notifications_read(actor: Actor = ACTOR):
+    if actor.user_id is None:
+        return {"marked": 0}
+    with get_conn() as conn:
+        cur = conn.execute("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL", (now_iso(), actor.user_id))
+        return {"marked": cur.rowcount}
 
 
 # ---------- Pantry ----------
@@ -634,7 +1089,7 @@ def find_pantry_duplicate(conn: sqlite3.Connection, name: str) -> sqlite3.Row | 
     return best if best_score >= 0.88 else None
 
 
-@app.get("/api/pantry", dependencies=HOUSEHOLD)
+@app.get("/api/pantry", dependencies=MEMBER)
 def list_pantry():
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM pantry_items ORDER BY category, name").fetchall()
@@ -664,7 +1119,7 @@ def _insert_pantry_item(conn: sqlite3.Connection, body: PantryItemIn) -> dict:
     return {**serialize_pantry(row), "duplicate": False}
 
 
-@app.post("/api/pantry", status_code=201, dependencies=HOUSEHOLD)
+@app.post("/api/pantry", status_code=201, dependencies=MEMBER)
 def create_pantry_item(body: Union[PantryItemIn, list[PantryItemIn]]):
     """Accepts one item or a list; a list is inserted in a single transaction and returns a list."""
     with get_conn() as conn:
@@ -677,7 +1132,7 @@ def create_pantry_item(body: Union[PantryItemIn, list[PantryItemIn]]):
         return _insert_pantry_item(conn, body)
 
 
-@app.patch("/api/pantry/{item_id}", dependencies=HOUSEHOLD)
+@app.patch("/api/pantry/{item_id}", dependencies=MEMBER)
 def update_pantry_item(item_id: int, body: PantryItemPatch):
     with get_conn() as conn:
         if not conn.execute("SELECT 1 FROM pantry_items WHERE id = ?", (item_id,)).fetchone():
@@ -697,7 +1152,7 @@ def update_pantry_item(item_id: int, body: PantryItemPatch):
         return serialize_pantry(conn.execute("SELECT * FROM pantry_items WHERE id = ?", (item_id,)).fetchone())
 
 
-@app.delete("/api/pantry/{item_id}", status_code=204, dependencies=HOUSEHOLD)
+@app.delete("/api/pantry/{item_id}", status_code=204, dependencies=MEMBER)
 def delete_pantry_item(item_id: int):
     with get_conn() as conn:
         if not conn.execute("SELECT 1 FROM pantry_items WHERE id = ?", (item_id,)).fetchone():
@@ -857,7 +1312,7 @@ def fetch_upkeep_or_404(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row:
     return i
 
 
-@app.get("/api/upkeep", dependencies=HOUSEHOLD)
+@app.get("/api/upkeep", dependencies=MEMBER)
 def list_upkeep(include_inactive: bool = False):
     with get_conn() as conn:
         where = "" if include_inactive else "WHERE active = 1"
@@ -865,7 +1320,7 @@ def list_upkeep(include_inactive: bool = False):
         return [serialize_upkeep(conn, i) for i in rows]
 
 
-@app.post("/api/upkeep", status_code=201, dependencies=HOUSEHOLD)
+@app.post("/api/upkeep", status_code=201, dependencies=MEMBER)
 def create_upkeep(body: UpkeepItemIn):
     with get_conn() as conn:
         cur = conn.execute(
@@ -880,7 +1335,7 @@ def create_upkeep(body: UpkeepItemIn):
         return serialize_upkeep(conn, fetch_upkeep_or_404(conn, cur.lastrowid))
 
 
-@app.patch("/api/upkeep/{item_id}", dependencies=HOUSEHOLD)
+@app.patch("/api/upkeep/{item_id}", dependencies=MEMBER)
 def update_upkeep(item_id: int, body: UpkeepItemPatch):
     with get_conn() as conn:
         fetch_upkeep_or_404(conn, item_id)
@@ -896,25 +1351,27 @@ def update_upkeep(item_id: int, body: UpkeepItemPatch):
         return serialize_upkeep(conn, fetch_upkeep_or_404(conn, item_id))
 
 
-@app.delete("/api/upkeep/{item_id}", status_code=204, dependencies=HOUSEHOLD)
+@app.delete("/api/upkeep/{item_id}", status_code=204, dependencies=MEMBER)
 def delete_upkeep(item_id: int):
     with get_conn() as conn:
         fetch_upkeep_or_404(conn, item_id)
         conn.execute("DELETE FROM upkeep_items WHERE id = ?", (item_id,))
 
 
-@app.post("/api/upkeep/{item_id}/logs", status_code=201, dependencies=HOUSEHOLD)
-def log_upkeep(item_id: int, body: UpkeepLogIn):
+@app.post("/api/upkeep/{item_id}/logs", status_code=201, dependencies=MEMBER)
+def log_upkeep(item_id: int, body: UpkeepLogIn, actor: Actor = ACTOR):
+    """A logged-in user's log entry is always recorded under their own name."""
     with get_conn() as conn:
         fetch_upkeep_or_404(conn, item_id)
+        by = actor.name if actor.user_id else (body.done_by.strip() or actor.name)
         conn.execute(
-            "INSERT INTO upkeep_logs (item_id, done_on, done_by, note) VALUES (?, ?, ?, ?)",
-            (item_id, body.done_on.isoformat(), body.done_by.strip(), body.note.strip()),
+            "INSERT INTO upkeep_logs (item_id, done_on, done_by, note, user_id) VALUES (?, ?, ?, ?, ?)",
+            (item_id, body.done_on.isoformat(), by, body.note.strip(), actor.user_id),
         )
         return serialize_upkeep(conn, fetch_upkeep_or_404(conn, item_id))
 
 
-@app.get("/api/upkeep/{item_id}/logs", dependencies=HOUSEHOLD)
+@app.get("/api/upkeep/{item_id}/logs", dependencies=MEMBER)
 def upkeep_history(item_id: int, limit: int = 50):
     with get_conn() as conn:
         fetch_upkeep_or_404(conn, item_id)
@@ -925,7 +1382,7 @@ def upkeep_history(item_id: int, limit: int = 50):
         return [dict(r) for r in rows]
 
 
-@app.delete("/api/upkeep-logs/{log_id}", status_code=204, dependencies=HOUSEHOLD)
+@app.delete("/api/upkeep-logs/{log_id}", status_code=204, dependencies=MEMBER)
 def delete_upkeep_log(log_id: int):
     with get_conn() as conn:
         if not conn.execute("SELECT 1 FROM upkeep_logs WHERE id = ?", (log_id,)).fetchone():
@@ -943,6 +1400,7 @@ def get_reminder_settings():
         "email_configured": notify.email_configured(),
         "due": notify.due_pickups(),
         "due_upkeep": notify.due_upkeep(),
+        "pending_assignments": notify.pending_assignment_notifications(),
     }
 
 
@@ -975,8 +1433,10 @@ def send_test_reminder():
 
 
 def task_days_until_due(t: dict) -> int | None:
-    """Days until a recurring task is due (negative = overdue). None for one-off tasks."""
+    """Days until a task is due (negative = overdue). None for one-off tasks with no due date."""
     if t["frequency_days"] is None:
+        if t.get("due_on") and not t.get("done"):
+            return (date.fromisoformat(t["due_on"]) - date.today()).days
         return None
     if t["last_completed_at"] is None:
         return 0
@@ -984,29 +1444,29 @@ def task_days_until_due(t: dict) -> int | None:
     return (last + timedelta(days=t["frequency_days"]) - date.today()).days
 
 
-def _status_task(t: dict, room: sqlite3.Row, days: int) -> dict:
+def _status_task(t: dict, days: int) -> dict:
     return {
         "id": t["id"],
         "title": t["title"],
-        "room_slug": room["slug"],
-        "room_name": room["name"],
+        "room_slug": t["room_slug"],
+        "room_name": t["room_name"],
+        "assignee": t["assignee"],
         "days_until_due": days,
         "last_completed_at": t["last_completed_at"],
     }
 
 
-@app.get("/api/status", dependencies=HOUSEHOLD)
+@app.get("/api/status", dependencies=MEMBER)
 def status_summary():
     overdue, due_today, due_week = [], [], []
     with get_conn() as conn:
-        rooms = {r["id"]: r for r in conn.execute("SELECT * FROM rooms ORDER BY sort_order, id").fetchall()}
-        tasks = conn.execute("SELECT * FROM tasks WHERE active = 1 ORDER BY sort_order, id").fetchall()
+        tasks = conn.execute(ACTIVE_TASKS_SQL).fetchall()
         for row in tasks:
             t = serialize_task(conn, row)
             days = task_days_until_due(t)
             if days is None:
                 continue
-            entry = _status_task(t, rooms[row["room_id"]], days)
+            entry = _status_task(t, days)
             if days < 0:
                 overdue.append(entry)
             elif days == 0:

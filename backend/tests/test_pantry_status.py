@@ -155,8 +155,8 @@ def test_status_reports_pantry_par_and_expiry(client, household_headers):
     assert [p["name"] for p in body["pantry_expiring_within_7_days"]] == ["Status expiring"]
 
 
-def test_status_reports_due_tasks_and_upkeep(client, household_headers):
-    room = client.post("/api/rooms", json={"name": "Status room"}, headers=household_headers).json()
+def test_status_reports_due_tasks_and_upkeep(client, household_headers, admin_headers):
+    room = client.post("/api/rooms", json={"name": "Status room"}, headers=admin_headers).json()
     task = client.post(
         "/api/tasks", json={"room_id": room["id"], "title": "Never done", "frequency_days": 7}, headers=household_headers
     ).json()

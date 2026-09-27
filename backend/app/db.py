@@ -12,24 +12,47 @@ CREATE TABLE IF NOT EXISTS rooms (
     slug TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     icon TEXT NOT NULL DEFAULT 'home',
-    sort_order INTEGER NOT NULL DEFAULT 0
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1
 );
 
+-- Old slugs after a rename, so NFC tags written with them keep resolving.
+CREATE TABLE IF NOT EXISTS room_slug_aliases (
+    slug TEXT PRIMARY KEY,
+    room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    role TEXT NOT NULL DEFAULT 'member',   -- 'admin' | 'member'
+    password_hash TEXT NOT NULL,
+    token_version TEXT NOT NULL DEFAULT '0',
+    email TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+-- room_id NULL = a standalone errand; assignee_id = whose list it is on; due_on = one-off due date
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    room_id INTEGER REFERENCES rooms(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     frequency_days INTEGER,
     sort_order INTEGER NOT NULL DEFAULT 0,
-    active INTEGER NOT NULL DEFAULT 1
+    active INTEGER NOT NULL DEFAULT 1,
+    assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    due_on TEXT,
+    created_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS completions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     completed_by TEXT NOT NULL,
-    completed_at TEXT NOT NULL
+    completed_at TEXT NOT NULL,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_completions_task ON completions(task_id, completed_at DESC);
 
@@ -87,9 +110,37 @@ CREATE TABLE IF NOT EXISTS upkeep_logs (
     done_on TEXT NOT NULL,
     done_by TEXT NOT NULL DEFAULT '',
     note TEXT NOT NULL DEFAULT '',
-    reminder_sent_at TEXT
+    reminder_sent_at TEXT,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_upkeep_logs ON upkeep_logs(item_id, done_on DESC);
+
+-- Standalone shopping items (the To Buy list also shows purchase notes and low pantry items)
+CREATE TABLE IF NOT EXISTS shopping_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    due_on TEXT,
+    added_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    bought_at TEXT,
+    bought_by TEXT NOT NULL DEFAULT ''
+);
+
+-- One row per assignment; the reminder loop emails unsent ones and the app shows unread ones
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,                 -- 'task' | 'shopping'
+    ref_id INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    read_at TEXT,
+    emailed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, read_at);
 
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -137,16 +188,66 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 """
 
 
+def _cols(conn, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _rebuild_tasks_nullable_room(conn: sqlite3.Connection) -> None:
+    """SQLite can't drop NOT NULL in place: copy tasks into the new shape. Runs with foreign
+    keys off so dropping the old table doesn't cascade into completions/notes."""
+    notnull = {r["name"]: r["notnull"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    if not notnull.get("room_id"):
+        return
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
+    conn.execute(
+        """CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            room_id INTEGER REFERENCES rooms(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            frequency_days INTEGER,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            due_on TEXT,
+            created_at TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, room_id, title, description, frequency_days, sort_order, active) "
+        "SELECT id, room_id, title, description, frequency_days, sort_order, active FROM tasks_old"
+    )
+    conn.execute("DROP TABLE tasks_old")
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with get_conn() as conn:
         conn.executescript(SCHEMA)
-        pantry_cols = {r["name"] for r in conn.execute("PRAGMA table_info(pantry_items)")}
+        pantry_cols = _cols(conn, "pantry_items")
         if "par_level" not in pantry_cols:
             conn.execute("ALTER TABLE pantry_items ADD COLUMN par_level REAL")
         if "expires_on" not in pantry_cols:
             conn.execute("ALTER TABLE pantry_items ADD COLUMN expires_on TEXT")
         conn.execute("UPDATE rooms SET name = 'Girls Room' WHERE name = 'GIrls Room'")
+        if "active" not in _cols(conn, "rooms"):
+            conn.execute("ALTER TABLE rooms ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+        _rebuild_tasks_nullable_room(conn)
+        for col, ddl in (
+            ("assignee_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL"),
+            ("due_on", "TEXT"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if col not in _cols(conn, "tasks"):
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
+        conn.execute("UPDATE tasks SET created_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now') WHERE created_at = ''")
+        for table in ("completions", "upkeep_logs"):
+            if "user_id" not in _cols(conn, table):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL")
 
 
 @contextmanager

@@ -1,7 +1,9 @@
 """Auth coverage for the whole /api surface.
 
 - No credentials -> 401 on every route except the allow-list.
-- Household session -> 403 on every admin-only route (admin/*, medications, pickups, activity, room delete).
+- Member (named non-admin user) session -> 403 on every admin-only route (admin/*, medications, pickups, activity).
+- Member and connector -> 403 on room changes are covered in test_rooms.py; here MANAGER routes are
+  checked for the connector (allowed) and member (denied).
 - Every registered /api route declares exactly one role dependency.
 """
 
@@ -10,16 +12,16 @@ from fastapi.routing import APIRoute
 
 from app import auth
 from app.main import PUBLIC_API_PATHS, SESSION_TOKEN_HEADER, app
+from tests.conftest import headers_for
 
 # (method, path, json body) — one representative read and write per route family.
 HOUSEHOLD_OK = [
     ("GET", "/api/session", None),
     ("GET", "/api/status", None),
-    # rooms (all but delete)
+    ("GET", "/api/users", None),
+    # rooms (read only; changes are MANAGER)
     ("GET", "/api/rooms", None),
     ("GET", "/api/rooms/kitchen", None),
-    ("POST", "/api/rooms", {"name": "X"}),
-    ("PATCH", "/api/rooms/1", {"name": "X"}),
     # tasks
     ("POST", "/api/tasks", {"room_id": 1, "title": "X"}),
     ("PATCH", "/api/tasks/1", {"title": "X"}),
@@ -48,8 +50,14 @@ HOUSEHOLD_OK = [
     ("DELETE", "/api/upkeep-logs/1", None),
 ]
 
+# admin or connector, never a member
+MANAGER_ONLY = [
+    ("POST", "/api/rooms", {"name": "X"}),
+    ("PATCH", "/api/rooms/1", {"icon": "home"}),
+    ("DELETE", "/api/rooms/999999", None),
+]
+
 ADMIN_ONLY = [
-    ("DELETE", "/api/rooms/1", None),
     ("GET", "/api/activity", None),
     # medications
     ("GET", "/api/medications", None),
@@ -60,8 +68,9 @@ ADMIN_ONLY = [
     ("GET", "/api/medications/1/pickups", None),
     ("DELETE", "/api/pickups/1", None),
     # admin
-    ("POST", "/api/admin/password", {"current_password": "x", "new_password": "yyyyyyyy"}),
-    ("PUT", "/api/admin/household-password", {"new_password": "yyyyyyyy"}),
+    ("POST", "/api/admin/users", {"name": "X", "password": "yyyyyyyy"}),
+    ("PATCH", "/api/admin/users/1", {"email": ""}),
+    ("DELETE", "/api/admin/users/1", None),
     ("GET", "/api/admin/reminders", None),
     ("PUT", "/api/admin/reminders", {"reminder_email": ""}),
     ("POST", "/api/admin/reminders/test", None),
@@ -69,7 +78,7 @@ ADMIN_ONLY = [
     ("DELETE", "/api/admin/connector", None),
 ]
 
-ALL_PROTECTED = HOUSEHOLD_OK + ADMIN_ONLY + [("GET", "/api/some/future/route", None)]
+ALL_PROTECTED = HOUSEHOLD_OK + MANAGER_ONLY + ADMIN_ONLY + [("GET", "/api/some/future/route", None)]
 
 
 def _id(v):
@@ -88,10 +97,16 @@ def test_bad_token_is_401(client, method, path, body):
     assert r.status_code == 401
 
 
-@pytest.mark.parametrize("method,path,body", ADMIN_ONLY, ids=_id)
+@pytest.mark.parametrize("method,path,body", ADMIN_ONLY + MANAGER_ONLY, ids=_id)
 def test_household_is_403_on_admin_routes(client, household_headers, method, path, body):
     r = client.request(method, path, json=body, headers=household_headers)
     assert r.status_code == 403, f"{method} {path} -> {r.status_code}"
+
+
+@pytest.mark.parametrize("method,path,body", MANAGER_ONLY, ids=_id)
+def test_connector_may_change_rooms(client, connector_headers, method, path, body):
+    r = client.request(method, path, json=body, headers=connector_headers)
+    assert r.status_code not in (401, 403), f"{method} {path} -> {r.status_code}"
 
 
 @pytest.mark.parametrize("method,path,body", ADMIN_ONLY, ids=_id)
@@ -132,17 +147,41 @@ def test_every_registered_admin_route_is_in_admin_only_list():
     for route in app.routes:
         if isinstance(route, APIRoute) and any(d.call is auth.need_admin for d in route.dependant.dependencies):
             for method in route.methods:
-                sample = route.path.replace("{room_id}", "1").replace("{med_id}", "1").replace("{pickup_id}", "1")
+                sample = route.path.replace("{user_id}", "1").replace("{med_id}", "1").replace("{pickup_id}", "1")
                 assert (method, sample) in listed, f"admin route {method} {route.path} missing from ADMIN_ONLY"
+
+
+def test_every_registered_manager_route_is_in_manager_only_list():
+    listed = {(m, p.replace("999999", "1")) for m, p, _ in MANAGER_ONLY}
+    for route in app.routes:
+        if isinstance(route, APIRoute) and any(d.call is auth.need_manager for d in route.dependant.dependencies):
+            for method in route.methods:
+                sample = route.path.replace("{room_id}", "1")
+                assert (method, sample) in listed, f"manager route {method} {route.path} missing from MANAGER_ONLY"
 
 
 def test_allow_list_is_open(client):
     assert client.get("/api/health").status_code == 200
-    assert client.post("/api/login", json={"password": "wrong"}).status_code == 401
-    r = client.post("/api/login", json={"password": "household-test-password"})
-    assert r.status_code == 200 and r.json()["role"] == "household"
-    r = client.post("/api/login", json={"password": "admin-test-password"})
+    assert set(client.get("/api/login/names").json()) == {"Courtney", "Magnus", "Susan", "Vanessa"}
+    assert client.post("/api/login", json={"name": "Susan", "password": "wrong"}).status_code == 401
+    assert client.post("/api/login", json={"name": "Nobody", "password": "susan-test-password"}).status_code == 401
+    assert client.post("/api/login", json={"password": "susan-test-password"}).status_code == 422
+    r = client.post("/api/login", json={"name": "susan", "password": "susan-test-password"})
+    assert r.status_code == 200 and r.json()["role"] == "member" and r.json()["user"]["name"] == "Susan"
+    r = client.post("/api/login", json={"name": "Courtney", "password": "admin-test-password"})
     assert r.status_code == 200 and r.json()["role"] == "admin"
+    r = client.post("/api/login", json={"name": "Magnus", "password": "magnus-test-password"})
+    assert r.status_code == 200 and r.json()["role"] == "admin"
+
+
+def test_each_person_has_their_own_password(client):
+    assert client.post("/api/login", json={"name": "Vanessa", "password": "susan-test-password"}).status_code == 401
+    assert client.post("/api/login", json={"name": "Vanessa", "password": "vanessa-test-password"}).status_code == 200
+
+
+def test_connector_has_no_personal_list(client, connector_headers, household_headers):
+    assert client.get("/api/me/list", headers=connector_headers).status_code == 403
+    assert client.get("/api/me/list", headers=household_headers).status_code == 200
 
 
 def test_admin_session_is_not_sliding(client, admin_headers):
@@ -154,13 +193,13 @@ def test_admin_session_is_not_sliding(client, admin_headers):
 def test_household_renewed_token_is_valid_and_keeps_role(client, household_headers):
     renewed = client.get("/api/session", headers=household_headers).headers[SESSION_TOKEN_HEADER]
     r = client.get("/api/session", headers={"Authorization": f"Bearer {renewed}"})
-    assert r.status_code == 200 and r.json()["role"] == "household"
+    assert r.status_code == 200 and r.json()["role"] == "member" and r.json()["user"]["name"] == "Susan"
     assert client.get("/api/medications", headers={"Authorization": f"Bearer {renewed}"}).status_code == 403
 
 
 def test_token_ttls():
     assert auth.TOKEN_TTL[auth.ADMIN] <= 30 * 24 * 3600
-    assert auth.TOKEN_TTL[auth.HOUSEHOLD] == 365 * 24 * 3600
+    assert auth.TOKEN_TTL[auth.MEMBER] == 365 * 24 * 3600
 
 
 def test_admin_read_and_write(client, admin_headers):
@@ -170,17 +209,30 @@ def test_admin_read_and_write(client, admin_headers):
     assert client.delete(f"/api/upkeep/{r.json()['id']}", headers=admin_headers).status_code == 204
 
 
-def test_changing_household_password_logs_household_out_but_not_admin(client, admin_headers):
-    hh = client.post("/api/login", json={"password": "household-test-password"}).json()["token"]
-    hh_headers = {"Authorization": f"Bearer {hh}"}
-    assert client.get("/api/session", headers=hh_headers).status_code == 200
-    assert client.put("/api/admin/household-password", json={"new_password": "new-hh-pass"}, headers=admin_headers).status_code == 200
-    assert client.get("/api/session", headers=hh_headers).status_code == 401
+def test_admin_resetting_a_password_logs_only_that_person_out(client, admin_headers):
+    vanessa = headers_for(client, "Vanessa")
+    susan = headers_for(client, "Susan")
+    vid = next(u["id"] for u in client.get("/api/users", headers=admin_headers).json() if u["name"] == "Vanessa")
+    assert client.patch(f"/api/admin/users/{vid}", json={"password": "new-v-pass"}, headers=admin_headers).status_code == 200
+    assert client.get("/api/session", headers=vanessa).status_code == 401
+    assert client.get("/api/session", headers=susan).status_code == 200
     assert client.get("/api/session", headers=admin_headers).status_code == 200
-    assert client.post("/api/login", json={"password": "household-test-password"}).status_code == 401
-    assert client.post("/api/login", json={"password": "new-hh-pass"}).json()["role"] == "household"
-    # restore for other tests
-    client.put("/api/admin/household-password", json={"new_password": "household-test-password"}, headers=admin_headers)
+    assert client.post("/api/login", json={"name": "Vanessa", "password": "vanessa-test-password"}).status_code == 401
+    assert client.post("/api/login", json={"name": "Vanessa", "password": "new-v-pass"}).status_code == 200
+    client.patch(f"/api/admin/users/{vid}", json={"password": "vanessa-test-password"}, headers=admin_headers)
+
+
+def test_member_can_change_own_password_but_not_others(client, admin_headers):
+    susan = headers_for(client, "Susan")
+    vid = next(u["id"] for u in client.get("/api/users", headers=admin_headers).json() if u["name"] == "Vanessa")
+    assert client.patch(f"/api/admin/users/{vid}", json={"password": "x" * 8}, headers=susan).status_code == 403
+    r = client.post("/api/me/password", json={"current_password": "wrong", "new_password": "new-s-pass"}, headers=susan)
+    assert r.status_code == 401
+    r = client.post("/api/me/password", json={"current_password": "susan-test-password", "new_password": "new-s-pass"}, headers=susan)
+    assert r.status_code == 200
+    assert client.post("/api/login", json={"name": "Susan", "password": "new-s-pass"}).status_code == 200
+    new = {"Authorization": f"Bearer {r.json()['token']}"}
+    client.post("/api/me/password", json={"current_password": "new-s-pass", "new_password": "susan-test-password"}, headers=new)
 
 
 def test_page_urls_never_write(client):
@@ -191,41 +243,37 @@ def test_page_urls_never_write(client):
         assert client.get(path).status_code in (200, 404)  # SPA shell only; 404 when frontend isn't built
 
 
-def test_env_password_replaces_legacy_default(monkeypatch):
-    """A stored legacy default ('home') counts as unset and is replaced from the env var on restart."""
-    auth.set_password(auth.HOUSEHOLD, auth.LEGACY_DEFAULT_PASSWORD[auth.HOUSEHOLD])
-    monkeypatch.setenv("HOUSEHOLD_PASSWORD", "from-env")
-    auth.ensure_admin_credentials()
-    assert auth.check_password(auth.HOUSEHOLD, "from-env")
-    # a password the admin chose is never overwritten by the env var
-    auth.set_password(auth.HOUSEHOLD, "chosen-by-admin")
-    auth.ensure_admin_credentials()
-    assert auth.check_password(auth.HOUSEHOLD, "chosen-by-admin")
-    auth.set_password(auth.HOUSEHOLD, "household-test-password")
-
-
-@pytest.mark.parametrize("env_var", ["HOUSEHOLD_PASSWORD", "ADMIN_PASSWORD"])
-def test_boot_fails_without_password_env_var(client, monkeypatch, env_var):
-    """No stored password + no env var -> startup aborts naming the variable. Nothing is seeded."""
+def test_env_can_add_a_missing_user_without_touching_existing(client, monkeypatch):
+    """HOME_USERS naming someone new creates them (password from PASSWORD_<NAME>); existing accounts,
+    including passwords chosen in the app, are never overwritten by env vars."""
     from app.db import get_conn
 
-    role = next(r for r, v in auth.PASSWORD_ENV.items() if v == env_var)
+    monkeypatch.setenv("HOME_USERS", "Courtney:admin,Magnus:admin,Susan,Vanessa,Grandma")
+    monkeypatch.setenv("PASSWORD_GRANDMA", "grandma-pass")
+    monkeypatch.setenv("PASSWORD_SUSAN", "should-be-ignored")
+    auth.ensure_users()
+    assert client.post("/api/login", json={"name": "Grandma", "password": "grandma-pass"}).json()["role"] == "member"
+    assert client.post("/api/login", json={"name": "Susan", "password": "should-be-ignored"}).status_code == 401
+    assert client.post("/api/login", json={"name": "Susan", "password": "susan-test-password"}).status_code == 200
     with get_conn() as conn:
-        stored = auth._get_setting(conn, auth.PASSWORD_KEY[role])
-        conn.execute("DELETE FROM settings WHERE key = ?", (auth.PASSWORD_KEY[role],))
-    monkeypatch.delenv(env_var, raising=False)
-    try:
-        with pytest.raises(auth.MissingPasswordError, match=env_var):
-            auth.ensure_admin_credentials()
-        with get_conn() as conn:
-            assert auth._get_setting(conn, auth.PASSWORD_KEY[role]) is None
-    finally:
-        with get_conn() as conn:
-            auth._set_setting(conn, auth.PASSWORD_KEY[role], stored)
+        conn.execute("DELETE FROM users WHERE name = 'Grandma'")
+
+
+def test_boot_fails_without_password_env_var(client, monkeypatch):
+    """A HOME_USERS name with no stored account and no PASSWORD_<NAME> -> startup aborts naming
+    the variable, and nothing is created."""
+    from app.db import get_conn
+
+    monkeypatch.setenv("HOME_USERS", "Courtney:admin,Magnus:admin,Susan,Vanessa,Aunt Jo")
+    monkeypatch.delenv("PASSWORD_AUNT_JO", raising=False)
+    with pytest.raises(auth.MissingPasswordError, match="PASSWORD_AUNT_JO"):
+        auth.ensure_users()
+    with get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM users WHERE name = 'Aunt Jo'").fetchone()[0] == 0
 
 
 def test_boot_fails_without_password_env_var_via_app(client, monkeypatch, tmp_path):
-    """Full app startup (lifespan) refuses to run and logs the missing variable."""
+    """Full app startup (lifespan) on a fresh database refuses to run and logs the missing variable."""
     import logging
 
     from fastapi.testclient import TestClient
@@ -234,6 +282,7 @@ def test_boot_fails_without_password_env_var_via_app(client, monkeypatch, tmp_pa
 
     monkeypatch.setattr(db, "DATA_DIR", tmp_path)
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "fresh.db")
+    monkeypatch.delenv("PASSWORD_VANESSA", raising=False)
     monkeypatch.delenv("HOUSEHOLD_PASSWORD", raising=False)
     records: list[logging.LogRecord] = []
 
@@ -248,5 +297,5 @@ def test_boot_fails_without_password_env_var_via_app(client, monkeypatch, tmp_pa
                 pass
     finally:
         logging.getLogger("uvicorn.error").removeHandler(handler)
-    assert any(r.levelno == logging.CRITICAL and "HOUSEHOLD_PASSWORD" in r.getMessage() for r in records)
+    assert any(r.levelno == logging.CRITICAL and "PASSWORD_VANESSA" in r.getMessage() for r in records)
 
