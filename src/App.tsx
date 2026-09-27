@@ -1,11 +1,13 @@
 import { Link, NavLink, Route, Routes } from 'react-router-dom'
-import { Home, Settings, ShoppingCart, User } from 'lucide-react'
+import { Home, Package, Pill, Settings, ShoppingCart, User } from 'lucide-react'
 import { useUserName } from './useUserName'
 import NamePrompt from './components/NamePrompt'
 import HomePage from './pages/HomePage'
 import RoomPage from './pages/RoomPage'
 import AdminPage from './pages/AdminPage'
 import ShoppingPage from './pages/ShoppingPage'
+import PantryPage from './pages/PantryPage'
+import MedsPage from './pages/MedsPage'
 
 export default function App() {
   const { name, setName } = useUserName()
@@ -29,7 +31,9 @@ export default function App() {
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/r/:slug" element={<RoomPage userName={name} />} />
-          <Route path="/shopping" element={<ShoppingPage />} />
+          <Route path="/shopping" element={<ShoppingPage userName={name} />} />
+          <Route path="/pantry" element={<PantryPage userName={name} />} />
+          <Route path="/meds" element={<MedsPage userName={name} />} />
           <Route path="/admin" element={<AdminPage />} />
           <Route path="*" element={<p className="text-center text-stone-500">Page not found.</p>} />
         </Routes>
@@ -38,6 +42,8 @@ export default function App() {
       <nav className="fixed inset-x-0 bottom-0 z-10 border-t border-stone-200 bg-white pb-[env(safe-area-inset-bottom)]">
         <div className="mx-auto flex max-w-xl justify-around">
           <Tab to="/" icon={<Home className="size-5" />} label="Rooms" />
+          <Tab to="/pantry" icon={<Package className="size-5" />} label="Pantry" />
+          <Tab to="/meds" icon={<Pill className="size-5" />} label="Meds" />
           <Tab to="/shopping" icon={<ShoppingCart className="size-5" />} label="To Buy" />
           <Tab to="/admin" icon={<Settings className="size-5" />} label="Manage" />
         </div>

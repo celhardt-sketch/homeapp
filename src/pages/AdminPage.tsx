@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Copy, Nfc, Pencil, Plus, Trash2, X } from 'lucide-react'
-import { api, formatFrequency, type Room, type RoomSummary, type Task } from '../api'
+import { Copy, KeyRound, Lock, LogOut, Mail, Nfc, Pencil, Plus, Trash2, X } from 'lucide-react'
+import { api, formatDay, formatFrequency, setAdminToken, type ReminderSettings, type Room, type RoomSummary, type Task } from '../api'
 import { ROOM_ICONS, RoomIcon } from '../icons'
+import { useAdminAuth } from '../useAdminAuth'
 
 const FREQUENCIES: { label: string; value: number | null }[] = [
   { label: 'As needed', value: null },
@@ -16,9 +17,66 @@ const FREQUENCIES: { label: string; value: number | null }[] = [
 ]
 
 export default function AdminPage() {
+  const { loggedIn, login, logout } = useAdminAuth()
+  if (loggedIn === null) return <p className="text-center text-sm text-stone-500">Loading…</p>
+  if (!loggedIn) return <LoginForm onLogin={login} />
+  return <AdminPanel onLogout={logout} />
+}
+
+function LoginForm({ onLogin }: { onLogin: (password: string) => Promise<void> }) {
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError(null)
+    try {
+      await onLogin(password)
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="mx-auto mt-10 max-w-sm space-y-4 rounded-2xl bg-white p-6 shadow-sm">
+      <div className="flex items-center gap-2">
+        <span className="flex size-10 items-center justify-center rounded-full bg-teal-50 text-teal-700">
+          <Lock className="size-5" />
+        </span>
+        <div>
+          <h1 className="text-lg font-semibold">Admin login</h1>
+          <p className="text-sm text-stone-500">Manage rooms, tasks and NFC tag links.</p>
+        </div>
+      </div>
+      <input
+        type="password"
+        autoFocus
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        placeholder="Password"
+        className="w-full rounded-lg border border-stone-300 px-3 py-2 outline-none focus:border-teal-600"
+      />
+      {error && <p className="rounded-lg bg-red-50 p-2 text-sm text-red-700">{error}</p>}
+      <button
+        type="submit"
+        disabled={!password || busy}
+        className="w-full rounded-lg bg-teal-700 px-3 py-2 font-medium text-white disabled:opacity-40"
+      >
+        Log in
+      </button>
+    </form>
+  )
+}
+
+function AdminPanel({ onLogout }: { onLogout: () => void }) {
   const [rooms, setRooms] = useState<RoomSummary[]>([])
   const [selected, setSelected] = useState<Room | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [showPassword, setShowPassword] = useState(false)
 
   const loadRooms = useCallback(() => {
     api.rooms().then(setRooms).catch((e: Error) => setError(e.message))
@@ -40,15 +98,39 @@ export default function AdminPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-xl font-semibold">Manage</h1>
-        <p className="text-sm text-stone-500">
-          Each room has a tag link. Write that link to an NFC tag and stick it in the room — scanning it opens
-          the room's task list.
-        </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold">Manage</h1>
+          <p className="text-sm text-stone-500">
+            Each room has a tag link. Write that link to an NFC tag and stick it in the room — scanning it opens
+            the room's task list.
+          </p>
+        </div>
+        <div className="flex shrink-0 gap-1">
+          <button
+            onClick={() => setShowPassword((v) => !v)}
+            className="rounded-lg p-2 text-stone-500 hover:bg-stone-200"
+            title="Change password"
+            aria-label="Change password"
+          >
+            <KeyRound className="size-4" />
+          </button>
+          <button
+            onClick={onLogout}
+            className="rounded-lg p-2 text-stone-500 hover:bg-stone-200"
+            title="Log out"
+            aria-label="Log out"
+          >
+            <LogOut className="size-4" />
+          </button>
+        </div>
       </div>
 
       {error && <p className="rounded-lg bg-red-50 p-2 text-sm text-red-700">{error}</p>}
+
+      {showPassword && <ChangePasswordForm onDone={() => setShowPassword(false)} />}
+
+      {!selected && <ReminderSettingsCard />}
 
       {!selected ? (
         <>
@@ -99,6 +181,144 @@ export default function AdminPage() {
         />
       )}
     </div>
+  )
+}
+
+function ReminderSettingsCard() {
+  const [settings, setSettings] = useState<ReminderSettings | null>(null)
+  const [email, setEmail] = useState('')
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  useEffect(() => {
+    api
+      .reminderSettings()
+      .then((s) => {
+        setSettings(s)
+        setEmail(s.reminder_email)
+      })
+      .catch((e: Error) => setMsg({ ok: false, text: e.message }))
+  }, [])
+
+  async function save() {
+    setMsg(null)
+    try {
+      setSettings(await api.saveReminderSettings(email))
+      setMsg({ ok: true, text: 'Saved.' })
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message })
+    }
+  }
+
+  async function sendTest() {
+    setMsg(null)
+    try {
+      if (settings && email !== settings.reminder_email) setSettings(await api.saveReminderSettings(email))
+      await api.sendTestReminder()
+      setMsg({ ok: true, text: `Test email sent to ${email}.` })
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message })
+    }
+  }
+
+  if (!settings) return null
+
+  return (
+    <section className="rounded-xl bg-white p-4 shadow-sm">
+      <h2 className="mb-1 flex items-center gap-2 font-medium">
+        <Mail className="size-5 text-teal-700" /> Medication reorder reminders
+      </h2>
+      <p className="mb-2 text-sm text-stone-500">
+        When a prescription hits its reorder date, an email goes to this address (checked hourly).
+      </p>
+      {!settings.email_configured && (
+        <p className="mb-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800">
+          Email sending isn't configured on the server yet (set RESEND_API_KEY or SMTP_HOST). Reminders still show in the
+          app.
+        </p>
+      )}
+      <div className="flex gap-2">
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="you@example.com"
+          className="flex-1 rounded-lg border border-stone-300 px-3 py-2 text-sm outline-none focus:border-teal-600"
+        />
+        <button
+          onClick={save}
+          disabled={email === settings.reminder_email}
+          className="rounded-lg bg-teal-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+        >
+          Save
+        </button>
+        <button
+          onClick={sendTest}
+          disabled={!email || !settings.email_configured}
+          className="rounded-lg border border-teal-700 px-3 py-2 text-sm font-medium text-teal-700 disabled:opacity-40"
+        >
+          Send test
+        </button>
+      </div>
+      {msg && (
+        <p className={`mt-2 rounded-lg p-2 text-sm ${msg.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
+          {msg.text}
+        </p>
+      )}
+      {settings.due.length > 0 && (
+        <p className="mt-2 text-xs text-stone-500">
+          Due now: {settings.due.map((d) => `${d.name} (${d.person}, ${formatDay(d.reorder_on)})`).join(', ')}
+        </p>
+      )}
+    </section>
+  )
+}
+
+function ChangePasswordForm({ onDone }: { onDone: () => void }) {
+  const [current, setCurrent] = useState('')
+  const [next, setNext] = useState('')
+  const [confirmNext, setConfirmNext] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    setError(null)
+    if (next !== confirmNext) {
+      setError('New passwords do not match')
+      return
+    }
+    try {
+      const { token } = await api.adminChangePassword(current, next)
+      setAdminToken(token)
+      setSaved(true)
+      setTimeout(onDone, 1200)
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }
+
+  const inputCls = 'w-full rounded-lg border border-stone-300 px-3 py-2 text-sm outline-none focus:border-teal-600'
+  return (
+    <form onSubmit={submit} className="space-y-2 rounded-xl bg-white p-4 shadow-sm">
+      <div className="flex items-center justify-between">
+        <h2 className="font-medium">Change admin password</h2>
+        <button type="button" onClick={onDone} className="text-stone-500" aria-label="Close">
+          <X className="size-4" />
+        </button>
+      </div>
+      <input type="password" value={current} onChange={(e) => setCurrent(e.target.value)} placeholder="Current password" className={inputCls} />
+      <input type="password" value={next} onChange={(e) => setNext(e.target.value)} placeholder="New password (min 4 characters)" className={inputCls} />
+      <input type="password" value={confirmNext} onChange={(e) => setConfirmNext(e.target.value)} placeholder="Confirm new password" className={inputCls} />
+      {error && <p className="rounded-lg bg-red-50 p-2 text-sm text-red-700">{error}</p>}
+      {saved && <p className="rounded-lg bg-green-50 p-2 text-sm text-green-700">Password updated.</p>}
+      <button
+        type="submit"
+        disabled={!current || next.length < 4 || !confirmNext}
+        className="rounded-lg bg-teal-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+      >
+        Update password
+      </button>
+    </form>
   )
 }
 

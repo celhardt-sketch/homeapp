@@ -1,14 +1,16 @@
+import asyncio
 import re
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import auth, notify
 from .db import get_conn, init_db
 from .seed import seed_if_empty
 
@@ -19,7 +21,10 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 async def lifespan(_: FastAPI):
     init_db()
     seed_if_empty()
+    auth.ensure_admin_credentials()
+    reminder_task = asyncio.create_task(notify.reminder_loop())
     yield
+    reminder_task.cancel()
 
 
 app = FastAPI(title="Home Maintenance", lifespan=lifespan)
@@ -77,6 +82,81 @@ class NoteIn(BaseModel):
 
 class NotePatch(BaseModel):
     resolved: bool
+
+
+class LoginIn(BaseModel):
+    password: str = Field(min_length=1, max_length=200)
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=4, max_length=200)
+
+
+class PantryItemIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    category: str = Field(default="", max_length=60)
+    quantity: str = Field(default="", max_length=60)
+    low: bool = False
+    updated_by: str = Field(default="", max_length=60)
+
+
+class PantryItemPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    category: str | None = Field(default=None, max_length=60)
+    quantity: str | None = Field(default=None, max_length=60)
+    low: bool | None = None
+    updated_by: str = Field(default="", max_length=60)
+
+
+class MedicationIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    person: str = Field(min_length=1, max_length=60)
+    reorder_days: int = Field(default=28, ge=1, le=365)
+    notes: str = Field(default="", max_length=500)
+
+
+class MedicationPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    person: str | None = Field(default=None, min_length=1, max_length=60)
+    reorder_days: int | None = Field(default=None, ge=1, le=365)
+    notes: str | None = Field(default=None, max_length=500)
+    active: bool | None = None
+
+
+class PickupIn(BaseModel):
+    picked_up_on: date
+    picked_up_by: str = Field(default="", max_length=60)
+
+
+class ReminderSettingsIn(BaseModel):
+    reminder_email: str = Field(max_length=200)
+
+
+ADMIN = [Depends(auth.require_admin)]
+
+
+# ---------- Admin auth ----------
+
+
+@app.post("/api/admin/login")
+def admin_login(body: LoginIn):
+    if not auth.check_password(body.password):
+        raise HTTPException(401, "Incorrect password")
+    return {"token": auth.issue_token()}
+
+
+@app.get("/api/admin/me", dependencies=ADMIN)
+def admin_me():
+    return {"ok": True}
+
+
+@app.post("/api/admin/password", dependencies=ADMIN)
+def admin_change_password(body: PasswordChangeIn):
+    if not auth.check_password(body.current_password):
+        raise HTTPException(401, "Current password is incorrect")
+    auth.set_password(body.new_password)
+    return {"token": auth.issue_token()}
 
 
 # ---------- Helpers ----------
@@ -178,7 +258,7 @@ def list_rooms():
         return [serialize_room(conn, r, with_tasks=False) for r in rows]
 
 
-@app.post("/api/rooms", status_code=201)
+@app.post("/api/rooms", status_code=201, dependencies=ADMIN)
 def create_room(body: RoomIn):
     slug = slugify(body.slug or body.name)
     with get_conn() as conn:
@@ -201,7 +281,7 @@ def get_room(slug: str):
         return serialize_room(conn, r, with_tasks=True)
 
 
-@app.patch("/api/rooms/{room_id}")
+@app.patch("/api/rooms/{room_id}", dependencies=ADMIN)
 def update_room(room_id: int, body: RoomPatch):
     with get_conn() as conn:
         fetch_room_or_404(conn, room_id)
@@ -221,7 +301,7 @@ def update_room(room_id: int, body: RoomPatch):
         return serialize_room(conn, fetch_room_or_404(conn, room_id), with_tasks=True)
 
 
-@app.delete("/api/rooms/{room_id}", status_code=204)
+@app.delete("/api/rooms/{room_id}", status_code=204, dependencies=ADMIN)
 def delete_room(room_id: int):
     with get_conn() as conn:
         fetch_room_or_404(conn, room_id)
@@ -231,7 +311,7 @@ def delete_room(room_id: int):
 # ---------- Tasks ----------
 
 
-@app.post("/api/tasks", status_code=201)
+@app.post("/api/tasks", status_code=201, dependencies=ADMIN)
 def create_task(body: TaskIn):
     with get_conn() as conn:
         fetch_room_or_404(conn, body.room_id)
@@ -245,7 +325,7 @@ def create_task(body: TaskIn):
         return serialize_task(conn, fetch_task_or_404(conn, cur.lastrowid))
 
 
-@app.patch("/api/tasks/{task_id}")
+@app.patch("/api/tasks/{task_id}", dependencies=ADMIN)
 def update_task(task_id: int, body: TaskPatch):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
@@ -262,7 +342,7 @@ def update_task(task_id: int, body: TaskPatch):
         return serialize_task(conn, fetch_task_or_404(conn, task_id))
 
 
-@app.delete("/api/tasks/{task_id}", status_code=204)
+@app.delete("/api/tasks/{task_id}", status_code=204, dependencies=ADMIN)
 def delete_task(task_id: int):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
@@ -358,6 +438,203 @@ def recent_activity(limit: int = 30):
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ---------- Pantry ----------
+
+
+def serialize_pantry(r: sqlite3.Row) -> dict:
+    return {**dict(r), "low": bool(r["low"])}
+
+
+@app.get("/api/pantry")
+def list_pantry():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM pantry_items ORDER BY category, name").fetchall()
+        return [serialize_pantry(r) for r in rows]
+
+
+@app.post("/api/pantry", status_code=201)
+def create_pantry_item(body: PantryItemIn):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO pantry_items (name, category, quantity, low, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (body.name.strip(), body.category.strip(), body.quantity.strip(), int(body.low), body.updated_by.strip(), now_iso()),
+        )
+        return serialize_pantry(conn.execute("SELECT * FROM pantry_items WHERE id = ?", (cur.lastrowid,)).fetchone())
+
+
+@app.patch("/api/pantry/{item_id}")
+def update_pantry_item(item_id: int, body: PantryItemPatch):
+    with get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM pantry_items WHERE id = ?", (item_id,)).fetchone():
+            raise HTTPException(404, "Item not found")
+        fields = body.model_dump(exclude_unset=True, exclude={"updated_by"})
+        if "low" in fields:
+            fields["low"] = int(fields["low"])
+        for k in ("name", "category", "quantity"):
+            if k in fields and fields[k] is not None:
+                fields[k] = fields[k].strip()
+        fields["updated_by"] = body.updated_by.strip()
+        fields["updated_at"] = now_iso()
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(f"UPDATE pantry_items SET {sets} WHERE id = ?", (*fields.values(), item_id))
+        return serialize_pantry(conn.execute("SELECT * FROM pantry_items WHERE id = ?", (item_id,)).fetchone())
+
+
+@app.delete("/api/pantry/{item_id}", status_code=204)
+def delete_pantry_item(item_id: int):
+    with get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM pantry_items WHERE id = ?", (item_id,)).fetchone():
+            raise HTTPException(404, "Item not found")
+        conn.execute("DELETE FROM pantry_items WHERE id = ?", (item_id,))
+
+
+# ---------- Medications ----------
+
+
+def serialize_medication(conn: sqlite3.Connection, m: sqlite3.Row) -> dict:
+    last = conn.execute(
+        "SELECT * FROM med_pickups WHERE medication_id = ? ORDER BY picked_up_on DESC, id DESC LIMIT 1",
+        (m["id"],),
+    ).fetchone()
+    reorder_on = None
+    days_left = None
+    status = "none"
+    if last:
+        reorder_date = date.fromisoformat(last["picked_up_on"]) + timedelta(days=m["reorder_days"])
+        reorder_on = reorder_date.isoformat()
+        days_left = (reorder_date - date.today()).days
+        status = "due" if days_left <= 0 else "soon" if days_left <= 5 else "ok"
+    return {
+        "id": m["id"],
+        "name": m["name"],
+        "person": m["person"],
+        "reorder_days": m["reorder_days"],
+        "notes": m["notes"],
+        "active": bool(m["active"]),
+        "last_picked_up_on": last["picked_up_on"] if last else None,
+        "last_picked_up_by": last["picked_up_by"] if last else None,
+        "last_pickup_id": last["id"] if last else None,
+        "reminder_sent_at": last["reminder_sent_at"] if last else None,
+        "reorder_on": reorder_on,
+        "days_left": days_left,
+        "status": status,
+    }
+
+
+def fetch_med_or_404(conn: sqlite3.Connection, med_id: int) -> sqlite3.Row:
+    m = conn.execute("SELECT * FROM medications WHERE id = ?", (med_id,)).fetchone()
+    if not m:
+        raise HTTPException(404, "Medication not found")
+    return m
+
+
+@app.get("/api/medications")
+def list_medications(include_inactive: bool = False):
+    with get_conn() as conn:
+        where = "" if include_inactive else "WHERE active = 1"
+        rows = conn.execute(f"SELECT * FROM medications {where} ORDER BY person, name").fetchall()
+        return [serialize_medication(conn, m) for m in rows]
+
+
+@app.post("/api/medications", status_code=201)
+def create_medication(body: MedicationIn):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO medications (name, person, reorder_days, notes) VALUES (?, ?, ?, ?)",
+            (body.name.strip(), body.person.strip(), body.reorder_days, body.notes.strip()),
+        )
+        return serialize_medication(conn, fetch_med_or_404(conn, cur.lastrowid))
+
+
+@app.patch("/api/medications/{med_id}")
+def update_medication(med_id: int, body: MedicationPatch):
+    with get_conn() as conn:
+        fetch_med_or_404(conn, med_id)
+        fields = body.model_dump(exclude_unset=True)
+        if "active" in fields:
+            fields["active"] = int(fields["active"])
+        for k in ("name", "person", "notes"):
+            if k in fields and fields[k] is not None:
+                fields[k] = fields[k].strip()
+        if fields:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            conn.execute(f"UPDATE medications SET {sets} WHERE id = ?", (*fields.values(), med_id))
+        return serialize_medication(conn, fetch_med_or_404(conn, med_id))
+
+
+@app.delete("/api/medications/{med_id}", status_code=204)
+def delete_medication(med_id: int):
+    with get_conn() as conn:
+        fetch_med_or_404(conn, med_id)
+        conn.execute("DELETE FROM medications WHERE id = ?", (med_id,))
+
+
+@app.post("/api/medications/{med_id}/pickups", status_code=201)
+def log_pickup(med_id: int, body: PickupIn):
+    with get_conn() as conn:
+        fetch_med_or_404(conn, med_id)
+        conn.execute(
+            "INSERT INTO med_pickups (medication_id, picked_up_on, picked_up_by) VALUES (?, ?, ?)",
+            (med_id, body.picked_up_on.isoformat(), body.picked_up_by.strip()),
+        )
+        return serialize_medication(conn, fetch_med_or_404(conn, med_id))
+
+
+@app.get("/api/medications/{med_id}/pickups")
+def pickup_history(med_id: int, limit: int = 50):
+    with get_conn() as conn:
+        fetch_med_or_404(conn, med_id)
+        rows = conn.execute(
+            "SELECT * FROM med_pickups WHERE medication_id = ? ORDER BY picked_up_on DESC, id DESC LIMIT ?",
+            (med_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+@app.delete("/api/pickups/{pickup_id}", status_code=204)
+def delete_pickup(pickup_id: int):
+    with get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM med_pickups WHERE id = ?", (pickup_id,)).fetchone():
+            raise HTTPException(404, "Pickup not found")
+        conn.execute("DELETE FROM med_pickups WHERE id = ?", (pickup_id,))
+
+
+# ---------- Reminder settings (admin) ----------
+
+
+@app.get("/api/admin/reminders", dependencies=ADMIN)
+def get_reminder_settings():
+    return {
+        "reminder_email": notify.get_reminder_email(),
+        "email_configured": notify.email_configured(),
+        "due": notify.due_pickups(),
+    }
+
+
+@app.put("/api/admin/reminders", dependencies=ADMIN)
+def set_reminder_settings(body: ReminderSettingsIn):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('reminder_email', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (body.reminder_email.strip(),),
+        )
+    return get_reminder_settings()
+
+
+@app.post("/api/admin/reminders/test", dependencies=ADMIN)
+def send_test_reminder():
+    if not notify.email_configured():
+        raise HTTPException(400, "Email isn't configured on the server (set RESEND_API_KEY or SMTP_HOST)")
+    to = notify.get_reminder_email()
+    if not to:
+        raise HTTPException(400, "Enter a reminder email address first")
+    try:
+        notify.send_email(to, "Home Maintenance test email", "Reminder emails are working.")
+    except Exception as e:
+        raise HTTPException(502, f"Sending failed: {e}")
+    return {"ok": True}
 
 
 @app.get("/api/health")
