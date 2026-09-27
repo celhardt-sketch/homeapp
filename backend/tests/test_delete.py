@@ -91,3 +91,19 @@ def test_mcp_remove_is_idempotent_and_never_guesses(mcp, client, admin_headers):
     assert again.pop("replayed") is True
     assert first == again and first["item"]["id"] == a["id"]
     client.delete(f"/api/shopping-items/{b['id']}", headers=admin_headers)
+
+
+def test_helper_can_add_and_delete_on_every_list(client, susan_headers, vanessa_headers):
+    """Upkeep, declutter, to-buy and pantry are shared lists: any signed-in person can add or delete."""
+    cases = [
+        ("/api/upkeep", {"name": "Wipe fridge coils", "interval_days": 180}, "/api/upkeep"),
+        ("/api/declutter", {"name": "Hall bench basket"}, "/api/declutter"),
+        ("/api/shopping-items", {"name": "Lightbulbs"}, "/api/shopping-items"),
+        ("/api/pantry", {"name": "Dried mango", "quantity": "1"}, "/api/pantry"),
+    ]
+    for post_path, body, delete_prefix in cases:
+        r = client.post(post_path, json=body, headers=susan_headers)
+        assert r.status_code == 201, (post_path, r.text)
+        created = r.json()
+        item_id = created["id"] if isinstance(created, dict) else created[0]["id"]
+        assert client.delete(f"{delete_prefix}/{item_id}", headers=vanessa_headers).status_code == 204, post_path
