@@ -124,6 +124,9 @@ export interface ReminderSettings {
 }
 
 const TOKEN_KEY = 'hm:adminToken'
+export const SESSION_EXPIRED_EVENT = 'hm:session-expired'
+// 401 from these means "wrong password typed", not an expired session.
+const PASSWORD_ROUTES = new Set(['/api/admin/login', '/api/admin/password'])
 
 export function getAdminToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
@@ -145,6 +148,10 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     },
   })
   if (!res.ok) {
+    if (res.status === 401 && token && !PASSWORD_ROUTES.has(url)) {
+      setAdminToken(null)
+      window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT))
+    }
     let detail = res.statusText
     try {
       const body = await res.json()

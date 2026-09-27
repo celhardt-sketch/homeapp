@@ -1,7 +1,9 @@
 import { Link, NavLink, Route, Routes } from 'react-router-dom'
 import { Home, Package, Pill, Settings, ShoppingCart, User, Wrench } from 'lucide-react'
 import { useUserName } from './useUserName'
+import { useAdminAuth } from './useAdminAuth'
 import NamePrompt from './components/NamePrompt'
+import LoginForm from './components/LoginForm'
 import HomePage from './pages/HomePage'
 import RoomPage from './pages/RoomPage'
 import AdminPage from './pages/AdminPage'
@@ -12,6 +14,7 @@ import UpkeepPage from './pages/UpkeepPage'
 
 export default function App() {
   const { name, setName } = useUserName()
+  const { loggedIn, login, logout } = useAdminAuth()
 
   return (
     <div className="mx-auto flex min-h-screen max-w-xl flex-col">
@@ -29,16 +32,20 @@ export default function App() {
       </header>
 
       <main className="flex-1 px-4 pb-24 pt-4">
-        <Routes>
-          <Route path="/" element={<HomePage />} />
-          <Route path="/r/:slug" element={<RoomPage userName={name} />} />
-          <Route path="/shopping" element={<ShoppingPage userName={name} />} />
-          <Route path="/pantry" element={<PantryPage userName={name} />} />
-          <Route path="/meds" element={<MedsPage userName={name} />} />
-          <Route path="/upkeep" element={<UpkeepPage userName={name} />} />
-          <Route path="/admin" element={<AdminPage />} />
-          <Route path="*" element={<p className="text-center text-stone-500">Page not found.</p>} />
-        </Routes>
+        {loggedIn === null && <p className="text-center text-sm text-stone-500">Loading…</p>}
+        {loggedIn === false && <LoginForm onLogin={login} />}
+        {loggedIn && (
+          <Routes>
+            <Route path="/" element={<HomePage />} />
+            <Route path="/r/:slug" element={<RoomPage userName={name} />} />
+            <Route path="/shopping" element={<ShoppingPage userName={name} />} />
+            <Route path="/pantry" element={<PantryPage userName={name} />} />
+            <Route path="/meds" element={<MedsPage userName={name} />} />
+            <Route path="/upkeep" element={<UpkeepPage userName={name} />} />
+            <Route path="/admin" element={<AdminPage onLogout={logout} />} />
+            <Route path="*" element={<p className="text-center text-stone-500">Page not found.</p>} />
+          </Routes>
+        )}
       </main>
 
       <nav className="fixed inset-x-0 bottom-0 z-10 border-t border-stone-200 bg-white pb-[env(safe-area-inset-bottom)]">
@@ -52,7 +59,7 @@ export default function App() {
         </div>
       </nav>
 
-      {!name && <NamePrompt onSubmit={setName} />}
+      {loggedIn && !name && <NamePrompt onSubmit={setName} />}
     </div>
   )
 }

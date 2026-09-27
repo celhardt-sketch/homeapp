@@ -5,8 +5,8 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,6 +28,20 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Home Maintenance", lifespan=lifespan)
+
+PUBLIC_API_PATHS = frozenset({"/api/health", "/api/admin/login"})
+
+
+@app.middleware("http")
+async def require_login_for_api(request: Request, call_next):
+    """Deny-by-default: every /api route needs a valid session token unless allow-listed."""
+    path = request.url.path.rstrip("/") or "/"
+    if (path == "/api" or path.startswith("/api/")) and path not in PUBLIC_API_PATHS:
+        try:
+            auth.require_admin(request.headers.get("authorization"))
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    return await call_next(request)
 
 
 def now_iso() -> str:
