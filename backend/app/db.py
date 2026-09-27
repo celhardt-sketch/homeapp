@@ -282,6 +282,25 @@ def init_db() -> None:
             if "user_id" not in _cols(conn, table):
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL")
         _migrate_medications_to_prescriptions(conn)
+        _remove_duplicate_rooms(conn)
+
+
+def _remove_duplicate_rooms(conn: sqlite3.Connection) -> None:
+    """Rooms created before the duplicate check existed: a room with no tasks whose name matches
+    another room (case-insensitive) is deleted and its slug kept as an alias of the survivor, so a
+    tag written with the duplicate's URL still opens the right room."""
+    dupes = conn.execute(
+        """
+        SELECT d.id, d.slug, k.id AS keep_id FROM rooms d
+        JOIN rooms k ON k.id <> d.id AND lower(trim(k.name)) = lower(trim(d.name))
+        WHERE NOT EXISTS (SELECT 1 FROM tasks t WHERE t.room_id = d.id)
+          AND (EXISTS (SELECT 1 FROM tasks t WHERE t.room_id = k.id) OR k.id < d.id)
+        """
+    ).fetchall()
+    for d in dupes:
+        conn.execute("INSERT OR IGNORE INTO room_slug_aliases (slug, room_id) VALUES (?, ?)", (d["slug"], d["keep_id"]))
+        conn.execute("UPDATE room_slug_aliases SET room_id = ? WHERE room_id = ?", (d["keep_id"], d["id"]))
+        conn.execute("DELETE FROM rooms WHERE id = ?", (d["id"],))
 
 
 def _migrate_medications_to_prescriptions(conn: sqlite3.Connection) -> None:
