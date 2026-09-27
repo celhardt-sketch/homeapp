@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, NavLink, Route, Routes } from 'react-router-dom'
-import { Bell, Home, ListChecks, Package, Pill, Settings, ShoppingCart, Wrench } from 'lucide-react'
+import { Bell, Boxes, Home, ListChecks, Package, Pill, Settings, ShoppingCart, Wrench } from 'lucide-react'
 import { api, formatDate, type Notification } from './api'
 import { useAdminAuth } from './useAdminAuth'
 import LoginForm from './components/LoginForm'
@@ -11,6 +11,7 @@ import ShoppingPage from './pages/ShoppingPage'
 import PantryPage from './pages/PantryPage'
 import RefillsPage from './pages/RefillsPage'
 import UpkeepPage from './pages/UpkeepPage'
+import DeclutterPage from './pages/DeclutterPage'
 import MyListPage from './pages/MyListPage'
 
 export default function App() {
@@ -42,6 +43,7 @@ export default function App() {
             <Route path="/refills" element={<RefillsPage isAdmin={isAdmin} />} />
             <Route path="/meds" element={<RefillsPage isAdmin={isAdmin} />} />
             <Route path="/upkeep" element={<UpkeepPage userName={name} />} />
+            <Route path="/declutter" element={<DeclutterPage />} />
             <Route path="/admin" element={<AdminPage session={session} onLogout={logout} />} />
             <Route path="*" element={<p className="text-center text-stone-500">Page not found.</p>} />
           </Routes>
@@ -53,6 +55,7 @@ export default function App() {
           <Tab to="/" icon={<ListChecks className="size-5" />} label="My list" />
           <Tab to="/rooms" icon={<Home className="size-5" />} label="Rooms" />
           <Tab to="/upkeep" icon={<Wrench className="size-5" />} label="Upkeep" />
+          <Tab to="/declutter" icon={<Boxes className="size-5" />} label="Declutter" />
           <Tab to="/pantry" icon={<Package className="size-5" />} label="Pantry" />
           <Tab to="/refills" icon={<Pill className="size-5" />} label="Refills" />
           <Tab to="/shopping" icon={<ShoppingCart className="size-5" />} label="To Buy" />

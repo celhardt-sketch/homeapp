@@ -48,6 +48,11 @@ HOUSEHOLD_OK = [
     ("POST", "/api/upkeep/1/logs", {"done_on": "2026-01-01"}),
     ("GET", "/api/upkeep/1/logs", None),
     ("DELETE", "/api/upkeep-logs/1", None),
+    # declutter
+    ("GET", "/api/declutter", None),
+    ("POST", "/api/declutter", {"name": "X"}),
+    ("PATCH", "/api/declutter/1", {"name": "X"}),
+    ("DELETE", "/api/declutter/1", None),
     # prescription refills (every named user can read, log pickups and mark called)
     ("GET", "/api/children", None),
     ("GET", "/api/prescriptions", None),

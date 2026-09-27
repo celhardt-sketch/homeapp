@@ -155,6 +155,18 @@ CREATE TABLE IF NOT EXISTS child_needs (
 );
 CREATE INDEX IF NOT EXISTS idx_child_needs ON child_needs(child_id, status);
 
+CREATE TABLE IF NOT EXISTS declutter_spots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    room_id INTEGER REFERENCES rooms(id) ON DELETE SET NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    done_on TEXT,
+    done_by TEXT NOT NULL DEFAULT '',
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS upkeep_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,

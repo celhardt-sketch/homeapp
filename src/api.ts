@@ -225,6 +225,21 @@ export interface UpkeepItem {
   status: MedStatus
 }
 
+export interface DeclutterSpot {
+  id: number
+  name: string
+  room_id: number | null
+  room: string | null
+  notes: string
+  done: boolean
+  done_on: string | null
+  done_by: string | null
+  days_since_done: number | null
+  created_at: string
+  created_by: string
+  duplicate?: boolean
+}
+
 export interface UpkeepLog {
   id: number
   item_id: number
@@ -404,6 +419,12 @@ export const api = {
   deleteUpkeep: (id: number) => request<void>(`/api/upkeep/${id}`, { method: 'DELETE' }),
   logUpkeep: (id: number, body: { done_on: string; done_by: string; note?: string }) =>
     request<UpkeepItem>(`/api/upkeep/${id}/logs`, { method: 'POST', body: JSON.stringify(body) }),
+  declutter: (includeDone = false) => request<DeclutterSpot[]>(`/api/declutter${includeDone ? '?include_done=true' : ''}`),
+  createDeclutter: (body: { name: string; room_id?: number | null; notes?: string }) =>
+    request<DeclutterSpot>('/api/declutter', { method: 'POST', body: JSON.stringify(body) }),
+  updateDeclutter: (id: number, body: { name?: string; room_id?: number | null; notes?: string; done?: boolean; done_on?: string }) =>
+    request<DeclutterSpot>(`/api/declutter/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteDeclutter: (id: number) => request<void>(`/api/declutter/${id}`, { method: 'DELETE' }),
   upkeepHistory: (id: number) => request<UpkeepLog[]>(`/api/upkeep/${id}/logs`),
   deleteUpkeepLog: (id: number) => request<void>(`/api/upkeep-logs/${id}`, { method: 'DELETE' }),
 
