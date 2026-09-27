@@ -31,7 +31,7 @@ Without either, reminders are still shown in the app.
 | Delete rooms, activity feed, medications, pickups, `/api/admin/*`, passwords | — (403) | yes |
 | Session | 365 days, sliding (renewed on every request) | 30 days |
 
-On first start the server sets the passwords from `ADMIN_PASSWORD` (default `admin`) and `HOUSEHOLD_PASSWORD` (default `home`). Change them from the Manage page (key icon, admin only) — they then live in the database and the env vars are no longer consulted. Changing a password logs out every device using that role.
+On first start the server sets the passwords from `ADMIN_PASSWORD` (default `admin`) and `HOUSEHOLD_PASSWORD` (default `home`). Change them from the Manage page (key icon, admin only) — they then live in the database and the env vars are ignored. Until you do, the env var wins on every start — so setting `HOUSEHOLD_PASSWORD` after the first deploy still takes effect on the next restart. Changing a password logs out every device using that role.
 
 ## Stack
 

@@ -50,12 +50,21 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(hash_password(password, bytes.fromhex(salt_hex)), stored)
 
 
+DEFAULT_PASSWORD = {ADMIN: "admin", HOUSEHOLD: "home"}
+PASSWORD_ENV = {ADMIN: "ADMIN_PASSWORD", HOUSEHOLD: "HOUSEHOLD_PASSWORD"}
+
+
 def ensure_admin_credentials() -> None:
+    """Seed each role's password from its env var. The env var also wins while the stored
+    password is still a built-in default, so setting it after first start still takes effect."""
     with get_conn() as conn:
-        if _get_setting(conn, PASSWORD_KEY[ADMIN]) is None:
-            _set_setting(conn, PASSWORD_KEY[ADMIN], hash_password(os.environ.get("ADMIN_PASSWORD", "admin")))
-        if _get_setting(conn, PASSWORD_KEY[HOUSEHOLD]) is None:
-            _set_setting(conn, PASSWORD_KEY[HOUSEHOLD], hash_password(os.environ.get("HOUSEHOLD_PASSWORD", "home")))
+        for role in ROLES:
+            stored = _get_setting(conn, PASSWORD_KEY[role])
+            env_password = os.environ.get(PASSWORD_ENV[role])
+            if stored is None:
+                _set_setting(conn, PASSWORD_KEY[role], hash_password(env_password or DEFAULT_PASSWORD[role]))
+            elif env_password and verify_password(DEFAULT_PASSWORD[role], stored):
+                _set_setting(conn, PASSWORD_KEY[role], hash_password(env_password))
         if _get_setting(conn, "token_secret") is None:
             _set_setting(conn, "token_secret", secrets.token_hex(32))
 

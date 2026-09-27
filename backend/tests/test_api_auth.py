@@ -172,3 +172,16 @@ def test_page_urls_never_write(client):
     assert not any("complete" in p for p in get_paths)
     for path in ("/", "/r/kitchen", "/upkeep"):
         assert client.get(path).status_code in (200, 404)  # SPA shell only; 404 when frontend isn't built
+
+
+def test_env_password_replaces_stored_default(monkeypatch):
+    """Setting HOUSEHOLD_PASSWORD after the DB was seeded with the default still takes effect on restart."""
+    auth.set_password(auth.HOUSEHOLD, auth.DEFAULT_PASSWORD[auth.HOUSEHOLD])
+    monkeypatch.setenv("HOUSEHOLD_PASSWORD", "from-env")
+    auth.ensure_admin_credentials()
+    assert auth.check_password(auth.HOUSEHOLD, "from-env")
+    # a password the admin chose is never overwritten by the env var
+    auth.set_password(auth.HOUSEHOLD, "chosen-by-admin")
+    auth.ensure_admin_credentials()
+    assert auth.check_password(auth.HOUSEHOLD, "chosen-by-admin")
+    auth.set_password(auth.HOUSEHOLD, "household-test-password")
