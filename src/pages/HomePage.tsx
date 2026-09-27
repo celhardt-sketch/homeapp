@@ -1,17 +1,22 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ChevronRight, StickyNote } from 'lucide-react'
-import { api, formatDate, type ActivityItem, type RoomSummary } from '../api'
+import { ChevronRight, StickyNote, Wrench } from 'lucide-react'
+import { api, formatDate, formatDay, type ActivityItem, type RoomSummary, type UpkeepItem } from '../api'
 import { RoomIcon } from '../icons'
 
 export default function HomePage() {
   const [rooms, setRooms] = useState<RoomSummary[] | null>(null)
   const [activity, setActivity] = useState<ActivityItem[]>([])
+  const [upkeepDue, setUpkeepDue] = useState<UpkeepItem[]>([])
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     api.rooms().then(setRooms).catch((e: Error) => setError(e.message))
     api.activity().then(setActivity).catch(() => {})
+    api
+      .upkeep()
+      .then((items) => setUpkeepDue(items.filter((i) => i.status === 'due' || i.status === 'soon').sort((a, b) => (a.days_left ?? 0) - (b.days_left ?? 0))))
+      .catch(() => {})
   }, [])
 
   if (error) return <p className="text-red-700">Couldn't load rooms: {error}</p>
@@ -19,6 +24,24 @@ export default function HomePage() {
 
   return (
     <div className="space-y-6">
+      {upkeepDue.length > 0 && (
+        <Link to="/upkeep" className="block rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm active:bg-amber-100">
+          <span className="flex items-center gap-2 font-medium text-amber-900">
+            <Wrench className="size-4" /> Home upkeep coming due
+            <ChevronRight className="ml-auto size-4 text-amber-700" />
+          </span>
+          <ul className="mt-1 space-y-0.5 text-amber-800">
+            {upkeepDue.slice(0, 4).map((i) => (
+              <li key={i.id}>
+                {i.name} ·{' '}
+                {i.days_left !== null && i.days_left <= 0 ? <span className="font-medium text-red-700">{i.days_left === 0 ? 'due today' : `overdue ${-i.days_left}d`}</span> : `due ${formatDay(i.due_on)}`}
+              </li>
+            ))}
+            {upkeepDue.length > 4 && <li>+{upkeepDue.length - 4} more</li>}
+          </ul>
+        </Link>
+      )}
+
       <section>
         <h1 className="mb-3 text-xl font-semibold">Rooms</h1>
         {rooms.length === 0 && (

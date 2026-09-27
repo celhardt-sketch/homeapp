@@ -129,6 +129,28 @@ class PickupIn(BaseModel):
     picked_up_by: str = Field(default="", max_length=60)
 
 
+class UpkeepItemIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    category: str = Field(default="", max_length=60)
+    interval_days: int = Field(default=90, ge=1, le=3650)
+    notes: str = Field(default="", max_length=500)
+    last_done_on: date | None = None
+
+
+class UpkeepItemPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    category: str | None = Field(default=None, max_length=60)
+    interval_days: int | None = Field(default=None, ge=1, le=3650)
+    notes: str | None = Field(default=None, max_length=500)
+    active: bool | None = None
+
+
+class UpkeepLogIn(BaseModel):
+    done_on: date
+    done_by: str = Field(default="", max_length=60)
+    note: str = Field(default="", max_length=500)
+
+
 class ReminderSettingsIn(BaseModel):
     reminder_email: str = Field(max_length=200)
 
@@ -601,6 +623,121 @@ def delete_pickup(pickup_id: int):
         conn.execute("DELETE FROM med_pickups WHERE id = ?", (pickup_id,))
 
 
+# ---------- Home upkeep (house-wide recurring maintenance) ----------
+
+
+def serialize_upkeep(conn: sqlite3.Connection, i: sqlite3.Row) -> dict:
+    last = conn.execute(
+        "SELECT * FROM upkeep_logs WHERE item_id = ? ORDER BY done_on DESC, id DESC LIMIT 1",
+        (i["id"],),
+    ).fetchone()
+    due_on = None
+    days_left = None
+    status = "none"
+    if last:
+        due_date = date.fromisoformat(last["done_on"]) + timedelta(days=i["interval_days"])
+        due_on = due_date.isoformat()
+        days_left = (due_date - date.today()).days
+        soon_window = max(3, i["interval_days"] // 10)
+        status = "due" if days_left <= 0 else "soon" if days_left <= soon_window else "ok"
+    return {
+        "id": i["id"],
+        "name": i["name"],
+        "category": i["category"],
+        "interval_days": i["interval_days"],
+        "notes": i["notes"],
+        "active": bool(i["active"]),
+        "last_done_on": last["done_on"] if last else None,
+        "last_done_by": last["done_by"] if last else None,
+        "due_on": due_on,
+        "days_left": days_left,
+        "status": status,
+    }
+
+
+def fetch_upkeep_or_404(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row:
+    i = conn.execute("SELECT * FROM upkeep_items WHERE id = ?", (item_id,)).fetchone()
+    if not i:
+        raise HTTPException(404, "Item not found")
+    return i
+
+
+@app.get("/api/upkeep")
+def list_upkeep(include_inactive: bool = False):
+    with get_conn() as conn:
+        where = "" if include_inactive else "WHERE active = 1"
+        rows = conn.execute(f"SELECT * FROM upkeep_items {where} ORDER BY category, name").fetchall()
+        return [serialize_upkeep(conn, i) for i in rows]
+
+
+@app.post("/api/upkeep", status_code=201)
+def create_upkeep(body: UpkeepItemIn):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO upkeep_items (name, category, interval_days, notes) VALUES (?, ?, ?, ?)",
+            (body.name.strip(), body.category.strip(), body.interval_days, body.notes.strip()),
+        )
+        if body.last_done_on:
+            conn.execute(
+                "INSERT INTO upkeep_logs (item_id, done_on) VALUES (?, ?)",
+                (cur.lastrowid, body.last_done_on.isoformat()),
+            )
+        return serialize_upkeep(conn, fetch_upkeep_or_404(conn, cur.lastrowid))
+
+
+@app.patch("/api/upkeep/{item_id}")
+def update_upkeep(item_id: int, body: UpkeepItemPatch):
+    with get_conn() as conn:
+        fetch_upkeep_or_404(conn, item_id)
+        fields = body.model_dump(exclude_unset=True)
+        if "active" in fields:
+            fields["active"] = int(fields["active"])
+        for k in ("name", "category", "notes"):
+            if k in fields and fields[k] is not None:
+                fields[k] = fields[k].strip()
+        if fields:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            conn.execute(f"UPDATE upkeep_items SET {sets} WHERE id = ?", (*fields.values(), item_id))
+        return serialize_upkeep(conn, fetch_upkeep_or_404(conn, item_id))
+
+
+@app.delete("/api/upkeep/{item_id}", status_code=204)
+def delete_upkeep(item_id: int):
+    with get_conn() as conn:
+        fetch_upkeep_or_404(conn, item_id)
+        conn.execute("DELETE FROM upkeep_items WHERE id = ?", (item_id,))
+
+
+@app.post("/api/upkeep/{item_id}/logs", status_code=201)
+def log_upkeep(item_id: int, body: UpkeepLogIn):
+    with get_conn() as conn:
+        fetch_upkeep_or_404(conn, item_id)
+        conn.execute(
+            "INSERT INTO upkeep_logs (item_id, done_on, done_by, note) VALUES (?, ?, ?, ?)",
+            (item_id, body.done_on.isoformat(), body.done_by.strip(), body.note.strip()),
+        )
+        return serialize_upkeep(conn, fetch_upkeep_or_404(conn, item_id))
+
+
+@app.get("/api/upkeep/{item_id}/logs")
+def upkeep_history(item_id: int, limit: int = 50):
+    with get_conn() as conn:
+        fetch_upkeep_or_404(conn, item_id)
+        rows = conn.execute(
+            "SELECT * FROM upkeep_logs WHERE item_id = ? ORDER BY done_on DESC, id DESC LIMIT ?",
+            (item_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+@app.delete("/api/upkeep-logs/{log_id}", status_code=204)
+def delete_upkeep_log(log_id: int):
+    with get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM upkeep_logs WHERE id = ?", (log_id,)).fetchone():
+            raise HTTPException(404, "Log entry not found")
+        conn.execute("DELETE FROM upkeep_logs WHERE id = ?", (log_id,))
+
+
 # ---------- Reminder settings (admin) ----------
 
 
@@ -610,6 +747,7 @@ def get_reminder_settings():
         "reminder_email": notify.get_reminder_email(),
         "email_configured": notify.email_configured(),
         "due": notify.due_pickups(),
+        "due_upkeep": notify.due_upkeep(),
     }
 
 

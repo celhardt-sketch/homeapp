@@ -72,6 +72,25 @@ CREATE TABLE IF NOT EXISTS med_pickups (
 );
 CREATE INDEX IF NOT EXISTS idx_med_pickups ON med_pickups(medication_id, picked_up_on DESC);
 
+CREATE TABLE IF NOT EXISTS upkeep_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT '',
+    interval_days INTEGER NOT NULL DEFAULT 90,
+    notes TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS upkeep_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL REFERENCES upkeep_items(id) ON DELETE CASCADE,
+    done_on TEXT NOT NULL,
+    done_by TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    reminder_sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_upkeep_logs ON upkeep_logs(item_id, done_on DESC);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL

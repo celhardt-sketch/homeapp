@@ -266,7 +266,12 @@ function ReminderSettingsCard() {
       )}
       {settings.due.length > 0 && (
         <p className="mt-2 text-xs text-stone-500">
-          Due now: {settings.due.map((d) => `${d.name} (${d.person}, ${formatDay(d.reorder_on)})`).join(', ')}
+          Meds due now: {settings.due.map((d) => `${d.name} (${d.person}, ${formatDay(d.reorder_on)})`).join(', ')}
+        </p>
+      )}
+      {settings.due_upkeep.length > 0 && (
+        <p className="mt-2 text-xs text-stone-500">
+          Upkeep due now: {settings.due_upkeep.map((d) => `${d.name} (${formatDay(d.due_on)})`).join(', ')}
         </p>
       )}
     </section>
