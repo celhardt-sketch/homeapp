@@ -1,7 +1,7 @@
 """Auth coverage for the whole /api surface.
 
 - No credentials -> 401 on every route except the allow-list.
-- Member (named non-admin user) session -> 403 on every admin-only route (admin/*, medications, pickups, activity).
+- Member (named non-admin user) session -> 403 on every admin-only route (admin/*, activity) and manager route.
 - Member and connector -> 403 on room changes are covered in test_rooms.py; here MANAGER routes are
   checked for the connector (allowed) and member (denied).
 - Every registered /api route declares exactly one role dependency.
@@ -48,6 +48,14 @@ HOUSEHOLD_OK = [
     ("POST", "/api/upkeep/1/logs", {"done_on": "2026-01-01"}),
     ("GET", "/api/upkeep/1/logs", None),
     ("DELETE", "/api/upkeep-logs/1", None),
+    # prescription refills (every named user can read, log pickups and mark called)
+    ("GET", "/api/children", None),
+    ("GET", "/api/prescriptions", None),
+    ("GET", "/api/refills", None),
+    ("POST", "/api/prescriptions/1/pickups", {"picked_up_on": "2026-01-01"}),
+    ("GET", "/api/prescriptions/1/pickups", None),
+    ("DELETE", "/api/pickups/1", None),
+    ("POST", "/api/prescriptions/1/called", {}),
 ]
 
 # admin or connector, never a member
@@ -59,14 +67,11 @@ MANAGER_ONLY = [
 
 ADMIN_ONLY = [
     ("GET", "/api/activity", None),
-    # medications
-    ("GET", "/api/medications", None),
-    ("POST", "/api/medications", {"name": "X", "person": "X"}),
-    ("PATCH", "/api/medications/1", {"name": "X"}),
-    ("DELETE", "/api/medications/1", None),
-    ("POST", "/api/medications/1/pickups", {"picked_up_on": "2026-01-01"}),
-    ("GET", "/api/medications/1/pickups", None),
-    ("DELETE", "/api/pickups/1", None),
+    # only admins add, edit or deactivate children and prescriptions (the connector too)
+    ("POST", "/api/children", {"name": "X"}),
+    ("PATCH", "/api/children/1", {"name": "X"}),
+    ("POST", "/api/prescriptions", {"child_id": 1, "name": "X"}),
+    ("PATCH", "/api/prescriptions/1", {"name": "X"}),
     # admin
     ("POST", "/api/admin/users", {"name": "X", "password": "yyyyyyyy"}),
     ("PATCH", "/api/admin/users/1", {"email": ""}),
@@ -111,7 +116,7 @@ def test_connector_may_change_rooms(client, connector_headers, method, path, bod
 
 @pytest.mark.parametrize("method,path,body", ADMIN_ONLY, ids=_id)
 def test_connector_is_403_on_admin_routes(client, connector_headers, method, path, body):
-    """The MCP connector's OAuth token is rejected from medications, pickups and every /api/admin route."""
+    """The MCP connector's OAuth token is rejected from every /api/admin route."""
     r = client.request(method, path, json=body, headers=connector_headers)
     assert r.status_code == 403, f"{method} {path} -> {r.status_code}"
 
@@ -147,7 +152,7 @@ def test_every_registered_admin_route_is_in_admin_only_list():
     for route in app.routes:
         if isinstance(route, APIRoute) and any(d.call is auth.need_admin for d in route.dependant.dependencies):
             for method in route.methods:
-                sample = route.path.replace("{user_id}", "1").replace("{med_id}", "1").replace("{pickup_id}", "1")
+                sample = route.path.replace("{user_id}", "1").replace("{child_id}", "1").replace("{rx_id}", "1")
                 assert (method, sample) in listed, f"admin route {method} {route.path} missing from ADMIN_ONLY"
 
 
@@ -156,7 +161,7 @@ def test_every_registered_manager_route_is_in_manager_only_list():
     for route in app.routes:
         if isinstance(route, APIRoute) and any(d.call is auth.need_manager for d in route.dependant.dependencies):
             for method in route.methods:
-                sample = route.path.replace("{room_id}", "1")
+                sample = route.path.replace("{room_id}", "1").replace("{child_id}", "1").replace("{rx_id}", "1")
                 assert (method, sample) in listed, f"manager route {method} {route.path} missing from MANAGER_ONLY"
 
 
@@ -194,7 +199,7 @@ def test_household_renewed_token_is_valid_and_keeps_role(client, household_heade
     renewed = client.get("/api/session", headers=household_headers).headers[SESSION_TOKEN_HEADER]
     r = client.get("/api/session", headers={"Authorization": f"Bearer {renewed}"})
     assert r.status_code == 200 and r.json()["role"] == "member" and r.json()["user"]["name"] == "Susan"
-    assert client.get("/api/medications", headers={"Authorization": f"Bearer {renewed}"}).status_code == 403
+    assert client.get("/api/activity", headers={"Authorization": f"Bearer {renewed}"}).status_code == 403
 
 
 def test_token_ttls():
@@ -203,7 +208,7 @@ def test_token_ttls():
 
 
 def test_admin_read_and_write(client, admin_headers):
-    assert client.get("/api/medications", headers=admin_headers).status_code == 200
+    assert client.get("/api/activity", headers=admin_headers).status_code == 200
     r = client.post("/api/upkeep", json={"name": "Test", "interval_days": 30}, headers=admin_headers)
     assert r.status_code == 201
     assert client.delete(f"/api/upkeep/{r.json()['id']}", headers=admin_headers).status_code == 204

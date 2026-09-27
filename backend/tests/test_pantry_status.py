@@ -4,6 +4,7 @@ from datetime import date, timedelta
 
 import pytest
 
+from app.db import get_conn
 from app.main import app
 from fastapi.routing import APIRoute
 
@@ -134,6 +135,7 @@ def test_status_shape(client, household_headers):
         "upkeep_due",
         "pantry_below_par",
         "pantry_expiring_within_7_days",
+        "refills",
     }
     assert all(isinstance(body[k], list) for k in body if k != "generated_on")
 
@@ -176,26 +178,41 @@ def test_status_reports_due_tasks_and_upkeep(client, household_headers, admin_he
 
 
 @pytest.mark.parametrize("who", ["household_headers", "admin_headers"])
-def test_status_never_contains_medication_data(client, admin_headers, request, who):
-    """Summary endpoints are an easy way to leak past a role boundary: assert no med fields for any role."""
-    med = client.post(
-        "/api/medications", json={"name": "Zestril-secret", "person": "Grandma-secret"}, headers=admin_headers
+def test_status_refills_section_is_the_only_medication_data(client, admin_headers, request, who):
+    """/api/status carries the refills digest (child, prescription, days of supply left for anything
+    refill_due/urgent) and nothing else medication-related: no pharmacy, contacts, notes or pickup history."""
+    child = client.post("/api/children", json={"name": "Statuskid"}, headers=admin_headers).json()
+    rx = client.post(
+        "/api/prescriptions",
+        json={"child_id": child["id"], "name": "Zestril-secret", "pharmacy": "Walgreens-secret",
+              "contact_name": "DrSecret", "contact_phone": "555-0199", "notes": "note-secret"},
+        headers=admin_headers,
     ).json()
     client.post(
-        "/api/medications/%d/pickups" % med["id"],
-        json={"picked_up_on": (date.today() - timedelta(days=40)).isoformat()},
+        f"/api/prescriptions/{rx['id']}/pickups",
+        json={"picked_up_on": (date.today() - timedelta(days=29)).isoformat(), "notes": "pickup-secret"},
         headers=admin_headers,
-    )  # overdue reorder, so it would show up if the endpoint summarised meds
+    )
     try:
         r = client.get("/api/status", headers=request.getfixturevalue(who))
         assert r.status_code == 200
-        keys = _keys(r.json(), set())
-        assert not any(w in k.lower() for k in keys for w in MED_WORDS), keys
+        body = r.json()
+        entry = next(e for e in body["refills"] if e["prescription_id"] == rx["id"])
+        assert entry == {
+            "prescription_id": rx["id"],
+            "child": "Statuskid",
+            "prescription": "Zestril-secret",
+            "refill_status": "refill_due",
+            "days_of_supply_left": 1,
+        }
         text = r.text.lower()
-        assert "zestril" not in text and "grandma" not in text
-        assert "medication" not in text and "pickup" not in text
+        for leak in ("walgreens", "drsecret", "555-0199", "note-secret", "pickup-secret", "picked_up"):
+            assert leak not in text, leak
+        other_keys = _keys({k: v for k, v in body.items() if k != "refills"}, set())
+        assert not any(w in k.lower() for k in other_keys for w in MED_WORDS), other_keys
     finally:
-        client.delete(f"/api/medications/{med['id']}", headers=admin_headers)
+        with get_conn() as conn:
+            conn.execute("DELETE FROM children WHERE id = ?", (child["id"],))
 
 
 def test_status_route_is_household_readable():

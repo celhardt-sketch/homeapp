@@ -24,6 +24,7 @@ TOOLS = {
     "log_upkeep_done", "list_pantry", "add_pantry_items", "update_pantry_item", "remove_pantry_item",
     "list_shopping", "add_to_shopping", "find",
     "add_to_list", "list_for_person", "add_room", "rename_room", "archive_room",
+    "list_refills", "log_pickup", "mark_called", "list_prescriptions", "add_prescription",
 }
 
 
@@ -114,7 +115,7 @@ def test_revoke_connector_keeps_household_and_admin_sessions(client, admin_heade
     assert client.post("/token", data={"grant_type": "refresh_token", "refresh_token": tok["refresh_token"],
                                        "client_id": tok["client_id"]}).status_code in (400, 401)
     assert client.get("/api/rooms", headers=household_headers).status_code == 200
-    assert client.get("/api/medications", headers=admin_headers).status_code == 200
+    assert client.get("/api/activity", headers=admin_headers).status_code == 200
     assert client.get("/api/admin/connector", headers=admin_headers).json()["connected"] is False
 
 
