@@ -47,6 +47,16 @@ def set_called_on(rx_id: int, when: str) -> None:
         conn.execute("UPDATE prescriptions SET called_on = ? WHERE id = ?", (when, rx_id))
 
 
+def test_near_duplicate_child_and_prescription_are_flagged_not_created(client, admin_headers, connector_headers, child):
+    r = client.post("/api/children", json={"name": "henry"}, headers=connector_headers)
+    assert r.status_code == 200 and r.json()["duplicate"] is True and r.json()["id"] == child["id"]
+    rx = make_rx(client, admin_headers, child, name="Focalin XR")
+    assert rx["duplicate"] is False
+    r = client.post("/api/prescriptions", json={"child_id": child["id"], "name": "focalin xr"}, headers=connector_headers)
+    assert r.status_code == 200 and r.json()["duplicate"] is True and r.json()["id"] == rx["id"]
+    assert len([p for p in client.get("/api/prescriptions", headers=admin_headers).json() if p["child_id"] == child["id"]]) == 1
+
+
 # ---------- derived status ----------
 
 

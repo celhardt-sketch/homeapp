@@ -17,6 +17,7 @@ from typing import Union
 
 from . import auth, notify, oauth, refills
 from .db import get_conn, init_db
+from .matching import similarity
 from .seed import seed_if_empty
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -878,7 +879,7 @@ def shopping_list():
         ]
 
 
-@app.get("/api/activity", dependencies=ADMIN)
+@app.get("/api/activity", dependencies=MANAGER)
 def recent_activity(limit: int = 30):
     with get_conn() as conn:
         rows = conn.execute(
@@ -1214,17 +1215,27 @@ def list_children(include_inactive: bool = False):
         return [serialize_child(c) for c in conn.execute(f"SELECT * FROM children {where} ORDER BY name")]
 
 
-@app.post("/api/children", status_code=201, dependencies=ADMIN)
-def create_child(body: ChildIn):
+@app.post("/api/children", status_code=201, dependencies=MANAGER)
+def create_child(body: ChildIn, response: Response):
+    """Adds a child. A name closely matching an existing child returns that child flagged as a
+    duplicate (200) instead of adding a second."""
+    name = body.name.strip()
     with get_conn() as conn:
-        dup = conn.execute("SELECT * FROM children WHERE lower(name) = lower(?)", (body.name.strip(),)).fetchone()
+        kids = [dict(c) for c in conn.execute("SELECT * FROM children")]
+        dup = _closest(name, kids)
         if dup:
-            return serialize_child(dup)
-        cur = conn.execute("INSERT INTO children (name) VALUES (?)", (body.name.strip(),))
-        return serialize_child(fetch_child_or_404(conn, cur.lastrowid))
+            response.status_code = 200
+            return {**serialize_child(dup), "duplicate": True, "duplicate_of": dup["name"]}
+        cur = conn.execute("INSERT INTO children (name) VALUES (?)", (name,))
+        return {**serialize_child(fetch_child_or_404(conn, cur.lastrowid)), "duplicate": False}
 
 
-@app.patch("/api/children/{child_id}", dependencies=ADMIN)
+def _closest(name: str, rows: list[dict], threshold: float = 0.9) -> dict | None:
+    best = max(rows, key=lambda r: similarity(name, r["name"]), default=None)
+    return best if best and similarity(name, best["name"]) >= threshold else None
+
+
+@app.patch("/api/children/{child_id}", dependencies=MANAGER)
 def update_child(child_id: int, body: ChildPatch):
     with get_conn() as conn:
         fetch_child_or_404(conn, child_id)
@@ -1262,12 +1273,21 @@ def list_due_refills():
         return refills.due_refills(conn)
 
 
-@app.post("/api/prescriptions", status_code=201, dependencies=ADMIN)
-def create_prescription(body: PrescriptionIn):
+@app.post("/api/prescriptions", status_code=201, dependencies=MANAGER)
+def create_prescription(body: PrescriptionIn, response: Response):
+    """A prescription whose name closely matches one the same child already has is returned
+    flagged as a duplicate (200) instead of being added twice."""
     with get_conn() as conn:
         fetch_child_or_404(conn, body.child_id)
         if body.assignee_id is not None:
             fetch_user_or_404(conn, body.assignee_id)
+        existing = [
+            dict(p) for p in conn.execute("SELECT * FROM prescriptions WHERE child_id = ? AND active = 1", (body.child_id,))
+        ]
+        dup = _closest(body.name.strip(), existing)
+        if dup:
+            response.status_code = 200
+            return {**refills.serialize_prescription(conn, fetch_prescription_or_404(conn, dup["id"])), "duplicate": True, "duplicate_of": dup["name"]}
         cur = conn.execute(
             "INSERT INTO prescriptions (child_id, name, pharmacy, contact_name, contact_phone, days_supply, "
             "refill_after_days, notes, assignee_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1283,10 +1303,10 @@ def create_prescription(body: PrescriptionIn):
                 body.assignee_id,
             ),
         )
-        return refills.serialize_prescription(conn, fetch_prescription_or_404(conn, cur.lastrowid))
+        return {**refills.serialize_prescription(conn, fetch_prescription_or_404(conn, cur.lastrowid)), "duplicate": False}
 
 
-@app.patch("/api/prescriptions/{rx_id}", dependencies=ADMIN)
+@app.patch("/api/prescriptions/{rx_id}", dependencies=MANAGER)
 def update_prescription(rx_id: int, body: PrescriptionPatch):
     with get_conn() as conn:
         fetch_prescription_or_404(conn, rx_id)

@@ -378,14 +378,15 @@ export const api = {
   deletePantryItem: (id: number) => request<void>(`/api/pantry/${id}`, { method: 'DELETE' }),
 
   children: (includeInactive = false) => request<Child[]>(`/api/children${includeInactive ? '?include_inactive=true' : ''}`),
-  createChild: (name: string) => request<Child>('/api/children', { method: 'POST', body: JSON.stringify({ name }) }),
+  createChild: (name: string) =>
+    request<Child & { duplicate: boolean }>('/api/children', { method: 'POST', body: JSON.stringify({ name }) }),
   updateChild: (id: number, body: Partial<Pick<Child, 'name' | 'active'>>) =>
     request<Child>(`/api/children/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   prescriptions: (includeInactive = false) =>
     request<Prescription[]>(`/api/prescriptions${includeInactive ? '?include_inactive=true' : ''}`),
   refillsDue: () => request<Prescription[]>('/api/refills'),
   createPrescription: (body: PrescriptionInput) =>
-    request<Prescription>('/api/prescriptions', { method: 'POST', body: JSON.stringify(body) }),
+    request<Prescription & { duplicate: boolean }>('/api/prescriptions', { method: 'POST', body: JSON.stringify(body) }),
   updatePrescription: (id: number, body: Partial<PrescriptionInput> & { active?: boolean }) =>
     request<Prescription>(`/api/prescriptions/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   logPickup: (id: number, body: { picked_up_on: string; notes?: string; override?: boolean }) =>
