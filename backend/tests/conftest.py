@@ -29,6 +29,7 @@ def admin_headers(client):
     return {"Authorization": f"Bearer {_login(client, 'admin-test-password')['token']}"}
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def household_headers(client):
+    # function-scoped: a password-change test bumps the household token version
     return {"Authorization": f"Bearer {_login(client, 'household-test-password')['token']}"}

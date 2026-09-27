@@ -14,6 +14,7 @@ from app.main import PUBLIC_API_PATHS, SESSION_TOKEN_HEADER, app
 # (method, path, json body) — one representative read and write per route family.
 HOUSEHOLD_OK = [
     ("GET", "/api/session", None),
+    ("GET", "/api/status", None),
     # rooms (all but delete)
     ("GET", "/api/rooms", None),
     ("GET", "/api/rooms/kitchen", None),
@@ -174,9 +175,9 @@ def test_page_urls_never_write(client):
         assert client.get(path).status_code in (200, 404)  # SPA shell only; 404 when frontend isn't built
 
 
-def test_env_password_replaces_stored_default(monkeypatch):
-    """Setting HOUSEHOLD_PASSWORD after the DB was seeded with the default still takes effect on restart."""
-    auth.set_password(auth.HOUSEHOLD, auth.DEFAULT_PASSWORD[auth.HOUSEHOLD])
+def test_env_password_replaces_legacy_default(monkeypatch):
+    """A stored legacy default ('home') counts as unset and is replaced from the env var on restart."""
+    auth.set_password(auth.HOUSEHOLD, auth.LEGACY_DEFAULT_PASSWORD[auth.HOUSEHOLD])
     monkeypatch.setenv("HOUSEHOLD_PASSWORD", "from-env")
     auth.ensure_admin_credentials()
     assert auth.check_password(auth.HOUSEHOLD, "from-env")
@@ -185,3 +186,51 @@ def test_env_password_replaces_stored_default(monkeypatch):
     auth.ensure_admin_credentials()
     assert auth.check_password(auth.HOUSEHOLD, "chosen-by-admin")
     auth.set_password(auth.HOUSEHOLD, "household-test-password")
+
+
+@pytest.mark.parametrize("env_var", ["HOUSEHOLD_PASSWORD", "ADMIN_PASSWORD"])
+def test_boot_fails_without_password_env_var(client, monkeypatch, env_var):
+    """No stored password + no env var -> startup aborts naming the variable. Nothing is seeded."""
+    from app.db import get_conn
+
+    role = next(r for r, v in auth.PASSWORD_ENV.items() if v == env_var)
+    with get_conn() as conn:
+        stored = auth._get_setting(conn, auth.PASSWORD_KEY[role])
+        conn.execute("DELETE FROM settings WHERE key = ?", (auth.PASSWORD_KEY[role],))
+    monkeypatch.delenv(env_var, raising=False)
+    try:
+        with pytest.raises(auth.MissingPasswordError, match=env_var):
+            auth.ensure_admin_credentials()
+        with get_conn() as conn:
+            assert auth._get_setting(conn, auth.PASSWORD_KEY[role]) is None
+    finally:
+        with get_conn() as conn:
+            auth._set_setting(conn, auth.PASSWORD_KEY[role], stored)
+
+
+def test_boot_fails_without_password_env_var_via_app(client, monkeypatch, tmp_path):
+    """Full app startup (lifespan) refuses to run and logs the missing variable."""
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    from app import db
+
+    monkeypatch.setattr(db, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "fresh.db")
+    monkeypatch.delenv("HOUSEHOLD_PASSWORD", raising=False)
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logging.getLogger("uvicorn.error").addHandler(handler := Capture())
+    try:
+        with pytest.raises(auth.MissingPasswordError):
+            with TestClient(app):
+                pass
+    finally:
+        logging.getLogger("uvicorn.error").removeHandler(handler)
+    assert any(r.levelno == logging.CRITICAL and "HOUSEHOLD_PASSWORD" in r.getMessage() for r in records)
+

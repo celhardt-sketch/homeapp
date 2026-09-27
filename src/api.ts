@@ -62,10 +62,29 @@ export interface PantryItem {
   name: string
   category: string
   quantity: string
+  /** true when flagged by hand OR quantity <= par_level */
   low: boolean
+  low_flag: boolean
+  par_level: number | null
+  below_par: boolean
+  expires_on: string | null
+  days_to_expiry: number | null
   updated_by: string
   updated_at: string
 }
+
+export interface PantryItemInput {
+  name: string
+  category?: string
+  quantity?: string
+  low?: boolean
+  par_level?: number | null
+  expires_on?: string | null
+  updated_by: string
+}
+
+/** POST /api/pantry result: `duplicate` means an existing row was returned and nothing was inserted. */
+export type PantryCreated = PantryItem & { duplicate: boolean; requested_name?: string }
 
 export type MedStatus = 'none' | 'ok' | 'soon' | 'due'
 
@@ -218,9 +237,11 @@ export const api = {
   activity: () => request<ActivityItem[]>('/api/activity'),
 
   pantry: () => request<PantryItem[]>('/api/pantry'),
-  createPantryItem: (body: { name: string; category?: string; quantity?: string; low?: boolean; updated_by: string }) =>
-    request<PantryItem>('/api/pantry', { method: 'POST', body: JSON.stringify(body) }),
-  updatePantryItem: (id: number, body: Partial<Pick<PantryItem, 'name' | 'category' | 'quantity' | 'low'>> & { updated_by: string }) =>
+  createPantryItem: (body: PantryItemInput) =>
+    request<PantryCreated>('/api/pantry', { method: 'POST', body: JSON.stringify(body) }),
+  createPantryItems: (body: PantryItemInput[]) =>
+    request<PantryCreated[]>('/api/pantry', { method: 'POST', body: JSON.stringify(body) }),
+  updatePantryItem: (id: number, body: Partial<Omit<PantryItemInput, 'updated_by'>> & { updated_by: string }) =>
     request<PantryItem>(`/api/pantry/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deletePantryItem: (id: number) => request<void>(`/api/pantry/${id}`, { method: 'DELETE' }),
 
