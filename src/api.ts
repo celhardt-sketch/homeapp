@@ -12,15 +12,22 @@ export interface Note {
 
 export interface Task {
   id: number
-  room_id: number
+  room_id: number | null
+  room_name: string | null
+  room_slug: string | null
   title: string
   description: string
   frequency_days: number | null
   sort_order: number
   active: boolean
+  assignee_id: number | null
+  assignee: string | null
+  due_on: string | null
+  created_at: string
   last_completed_at: string | null
   last_completed_by: string | null
   status: TaskStatus
+  done: boolean
   notes: Note[]
 }
 
@@ -30,6 +37,7 @@ export interface RoomSummary {
   name: string
   icon: string
   sort_order: number
+  active: boolean
   task_count: number
   due_count: number
   note_count: number
@@ -39,13 +47,74 @@ export interface Room extends RoomSummary {
   tasks: Task[]
 }
 
+/** POST /api/rooms result: `duplicate` means an existing room was returned and nothing was created. */
+export type RoomCreated = Room & { duplicate: boolean; duplicate_of?: string }
+
 export interface Completion {
   id: number
   completed_by: string
   completed_at: string
+  user_id: number | null
 }
 
-export interface ShoppingItem extends Note {
+export interface User {
+  id: number
+  name: string
+  role: UserRole
+  active: boolean
+  email: string
+}
+
+export interface ShoppingItem {
+  id: number
+  name: string
+  notes: string
+  assignee_id: number | null
+  assignee: string | null
+  due_on: string | null
+  added_by: string
+  created_at: string
+  bought_at: string | null
+  bought_by: string | null
+  done: boolean
+  overdue: boolean
+}
+
+export interface ListItem {
+  kind: 'task' | 'shopping'
+  id: number
+  title: string
+  notes: string
+  room_name: string | null
+  room_slug: string | null
+  due_on: string | null
+  frequency_days: number | null
+  status: TaskStatus
+  overdue: boolean
+  done: boolean
+  created_at: string
+  last_completed_at: string | null
+  last_completed_by: string | null
+}
+
+export interface PersonList {
+  user: User
+  items: ListItem[]
+  overdue_count: number
+}
+
+export interface Notification {
+  id: number
+  user_id: number
+  kind: 'task' | 'shopping'
+  ref_id: number
+  message: string
+  created_by: string
+  created_at: string
+  read_at: string | null
+}
+
+export interface PurchaseNote extends Note {
   task_title: string
   room_name: string
   room_slug: string
@@ -150,12 +219,13 @@ export interface ReminderSettings {
   due_upkeep: { item_id: number; name: string; category: string; due_on: string }[]
 }
 
-export type Role = 'admin' | 'household'
+export type UserRole = 'admin' | 'member'
+export type Role = UserRole | 'connector'
 
 const TOKEN_KEY = 'hm:adminToken'
 export const SESSION_EXPIRED_EVENT = 'hm:session-expired'
 // 401 from these means "wrong password typed", not an expired session.
-const PASSWORD_ROUTES = new Set(['/api/login', '/api/admin/password'])
+const PASSWORD_ROUTES = new Set(['/api/login', '/api/me/password'])
 
 export class ApiError extends Error {
   status: number
@@ -198,7 +268,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiError(detail, res.status)
   }
-  // Household sessions slide: the server hands back a renewed token on every request.
+  // Member sessions slide: the server hands back a renewed token on every request.
   const renewed = res.headers.get('X-Session-Token')
   if (renewed) setAdminToken(renewed)
   if (res.status === 204) return undefined as T
@@ -206,32 +276,49 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  login: (password: string) =>
-    request<{ token: string; role: Role }>('/api/login', { method: 'POST', body: JSON.stringify({ password }) }),
-  session: () => request<{ role: Role }>('/api/session'),
-  setHouseholdPassword: (new_password: string) =>
-    request<{ ok: boolean }>('/api/admin/household-password', { method: 'PUT', body: JSON.stringify({ new_password }) }),
-  adminChangePassword: (current_password: string, new_password: string) =>
-    request<{ token: string }>('/api/admin/password', {
+  loginNames: () => request<string[]>('/api/login/names'),
+  login: (name: string, password: string) =>
+    request<{ token: string; role: Role; user: User }>('/api/login', { method: 'POST', body: JSON.stringify({ name, password }) }),
+  session: () => request<{ role: Role; user: User | null }>('/api/session'),
+  changeOwnPassword: (current_password: string, new_password: string) =>
+    request<{ token: string }>('/api/me/password', {
       method: 'POST',
       body: JSON.stringify({ current_password, new_password }),
     }),
 
-  rooms: () => request<RoomSummary[]>('/api/rooms'),
+  users: (includeInactive = false) => request<User[]>(`/api/users${includeInactive ? '?include_inactive=true' : ''}`),
+  createUser: (body: { name: string; role: UserRole; password: string; email?: string }) =>
+    request<User>('/api/admin/users', { method: 'POST', body: JSON.stringify(body) }),
+  updateUser: (id: number, body: Partial<Pick<User, 'name' | 'role' | 'email' | 'active'>> & { password?: string }) =>
+    request<User>(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteUser: (id: number) => request<void>(`/api/admin/users/${id}`, { method: 'DELETE' }),
+
+  myList: (includeDone = false) => request<PersonList>(`/api/me/list${includeDone ? '?include_done=true' : ''}`),
+  userList: (id: number, includeDone = false) =>
+    request<PersonList>(`/api/users/${id}/list${includeDone ? '?include_done=true' : ''}`),
+  notifications: () => request<Notification[]>('/api/me/notifications?limit=20'),
+  markNotificationsRead: () => request<{ marked: number }>('/api/me/notifications/read', { method: 'POST' }),
+
+  rooms: (includeArchived = false) => request<RoomSummary[]>(`/api/rooms${includeArchived ? '?include_archived=true' : ''}`),
   room: (slug: string) => request<Room>(`/api/rooms/${encodeURIComponent(slug)}`),
   createRoom: (body: { name: string; slug?: string; icon?: string }) =>
-    request<Room>('/api/rooms', { method: 'POST', body: JSON.stringify(body) }),
-  updateRoom: (id: number, body: Partial<Pick<RoomSummary, 'name' | 'slug' | 'icon'>>) =>
+    request<RoomCreated>('/api/rooms', { method: 'POST', body: JSON.stringify(body) }),
+  updateRoom: (id: number, body: Partial<Pick<RoomSummary, 'name' | 'slug' | 'icon' | 'active' | 'sort_order'>>) =>
     request<Room>(`/api/rooms/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteRoom: (id: number) => request<void>(`/api/rooms/${id}`, { method: 'DELETE' }),
 
-  createTask: (body: { room_id: number; title: string; description?: string; frequency_days?: number | null }) =>
-    request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(body) }),
-  updateTask: (id: number, body: Partial<Pick<Task, 'title' | 'description' | 'frequency_days' | 'active'>>) =>
+  createTask: (body: {
+    room_id?: number | null
+    title: string
+    description?: string
+    frequency_days?: number | null
+    assignee_id?: number | null
+    due_on?: string | null
+  }) => request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(body) }),
+  updateTask: (id: number, body: Partial<Pick<Task, 'title' | 'description' | 'frequency_days' | 'active' | 'assignee_id' | 'due_on'>>) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteTask: (id: number) => request<void>(`/api/tasks/${id}`, { method: 'DELETE' }),
-  completeTask: (id: number, completed_by: string) =>
-    request<Task>(`/api/tasks/${id}/complete`, { method: 'POST', body: JSON.stringify({ completed_by }) }),
+  completeTask: (id: number) => request<Task>(`/api/tasks/${id}/complete`, { method: 'POST', body: JSON.stringify({}) }),
   undoCompletion: (completionId: number) =>
     request<void>(`/api/completions/${completionId}`, { method: 'DELETE' }),
   history: (taskId: number) => request<Completion[]>(`/api/tasks/${taskId}/history`),
@@ -241,7 +328,13 @@ export const api = {
   resolveNote: (id: number, resolved = true) =>
     request<Note>(`/api/notes/${id}`, { method: 'PATCH', body: JSON.stringify({ resolved }) }),
 
-  shopping: () => request<ShoppingItem[]>('/api/shopping'),
+  shopping: () => request<PurchaseNote[]>('/api/shopping'),
+  shoppingItems: (includeDone = false) => request<ShoppingItem[]>(`/api/shopping-items${includeDone ? '?include_done=true' : ''}`),
+  createShoppingItem: (body: { name: string; notes?: string; assignee_id?: number | null; due_on?: string | null }) =>
+    request<ShoppingItem>('/api/shopping-items', { method: 'POST', body: JSON.stringify(body) }),
+  updateShoppingItem: (id: number, body: Partial<Pick<ShoppingItem, 'name' | 'notes' | 'assignee_id' | 'due_on'>> & { bought?: boolean }) =>
+    request<ShoppingItem>(`/api/shopping-items/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteShoppingItem: (id: number) => request<void>(`/api/shopping-items/${id}`, { method: 'DELETE' }),
   activity: () => request<ActivityItem[]>('/api/activity'),
 
   pantry: () => request<PantryItem[]>('/api/pantry'),
