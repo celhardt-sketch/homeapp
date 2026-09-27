@@ -39,6 +39,11 @@ Bathroom, Laundry Room, Carport, Little Boys Room, Big Boys Room, Girls Room, Do
 Claude picks MCP tools by reading them. Write each one the way a person would say the thing out
 loud.
 
+## A feature is not done until its MCP tools appear in tools/list
+Every REST endpoint or UI feature gets matching tools in `backend/app/mcp_server.py`, registered in
+`build_mcp()`, AND added to `EXPECTED_TOOLS` in `backend/tests/test_mcp.py`. That test compares the
+live `tools/list` against the constant exactly, so a tool missing from either side fails the suite.
+
 ## Staleness over silence
 Where a stored value goes out of date, return how old it is and flag it. A value presented as
 current when it is stale is worse than no value, because it will be trusted.

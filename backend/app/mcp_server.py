@@ -1,7 +1,8 @@
 """MCP server (Streamable HTTP at /mcp) so Claude can read and write the home app.
 
 Runs inside the FastAPI process and calls the same functions as the REST API, as the
-`connector` role: rooms, tasks, upkeep, pantry, shopping, prescription refills and status.
+`connector` role: rooms, tasks, people's lists, upkeep, pantry, shopping, children's sizes and
+needs, prescription refills and status. Every tool must be listed in tests/test_mcp.py EXPECTED_TOOLS.
 
 Every identifier argument accepts an id or a spoken name; see matching.py. When several
 rows plausibly match, a tool returns {"needs_disambiguation": true, "candidates": [...]}
@@ -21,7 +22,7 @@ from fastmcp.exceptions import ToolError
 from pydantic import Field
 
 from . import main as core
-from . import oauth, refills
+from . import kids, oauth, refills
 from .db import get_conn
 from .matching import Ambiguous, Match, NoMatch, resolve, similarity
 
@@ -39,7 +40,8 @@ def build_mcp() -> FastMCP:
     return FastMCP(
         name="Home",
         instructions=(
-            "Home maintenance, upkeep, pantry and shopping for one household. Refer to things by "
+            "Home maintenance, upkeep, pantry, shopping, the kids' sizes/needs and prescription refills "
+            "for one household. Refer to things by "
             "name; if a tool answers needs_disambiguation, ask the person which one they meant and "
             "call it again with the exact name or id."
         ),
@@ -63,6 +65,14 @@ def build_mcp() -> FastMCP:
             add_to_shopping,
             add_to_list,
             list_for_person,
+            list_children,
+            get_child,
+            set_size,
+            list_sizes,
+            add_need,
+            mark_have,
+            list_needs,
+            seasonal_check,
             list_refills,
             log_pickup,
             mark_called,
@@ -762,6 +772,252 @@ def add_prescription(
         }
 
     return _idempotent(idempotency_key, "add_prescription", lambda: _run(go))
+
+
+# ---------- children: sizes and needs ----------
+
+
+def _size_brief(s: dict) -> dict:
+    return {
+        "child": s["child"],
+        "category": s["category"],
+        "value": s["value"],
+        "notes": s["notes"],
+        "updated_by": s["updated_by"],
+        "age_days": s["age_days"],
+        "stale": s["stale"],
+        "note": f"Recorded {s['age_days']} days ago; kids grow, so check before buying." if s["stale"] else None,
+    }
+
+
+def _need_brief(n: dict) -> dict:
+    return {
+        "id": n["id"],
+        "child": n["child"],
+        "category": n["category"],
+        "season": n["season"],
+        "status": n["status"],
+        "notes": n["notes"],
+        "open_for_days": n["open_for_days"],
+        "on_shopping_list": n["shopping_item_id"] is not None,
+        "created_by": n["created_by"],
+        "resolved_by": n["resolved_by"] or None,
+    }
+
+
+def _resolve_category(conn, category: str, must_exist: bool = False, prefer_existing: bool = False) -> str:
+    """Writing (default): fold "shoe"/"Shoes" together, otherwise keep the words as said (so "pants"
+    is not turned into "Snow Pants"). Reading (must_exist): fuzzy like everything else, asking when
+    several fit. prefer_existing: fuzzy when something matches, otherwise take the words as said."""
+    if not must_exist and not prefer_existing:
+        return kids.canonical_category(conn, category)
+    known = [{"name": c} for c in kids.known_categories(conn)]
+    res = resolve(category, known)
+    if isinstance(res, Match):
+        return res.item["name"]
+    if isinstance(res, Ambiguous):
+        raise _AmbiguousError(_disambiguation("category", category, [{"category": c["name"]} for c in res.candidates]))
+    if prefer_existing:
+        return kids.canonical_category(conn, category)
+    raise _no_match("category", category, res.nearest, [c["name"] for c in known])
+
+
+def list_children() -> list[dict]:
+    """The kids in the house, with how many sizes, open needs and prescriptions each one has.
+    Use it to learn the children's names before asking about sizes, needs or refills."""
+    with get_conn() as conn:
+        out = []
+        for c in _all_children(conn):
+            out.append(
+                {
+                    "id": c["id"],
+                    "name": c["name"],
+                    "sizes_recorded": len(kids.sizes(conn, c["id"])),
+                    "open_needs": len(kids.needs(conn, c["id"])),
+                    "prescriptions": len([p for p in refills.active_prescriptions(conn) if p["child_id"] == c["id"]]),
+                }
+            )
+        return out
+
+
+def get_child(child: Annotated[str, Field(description="The child's first name (or id).")]) -> dict:
+    """Everything about one child: their current sizes (each with how old the value is), what they
+    still need, and how many prescriptions they have. For "what size is Henry" or "what does Ava need"."""
+
+    def go():
+        with get_conn() as conn:
+            kid = _resolve_child(conn, child)
+            full = core.get_child(kid["id"])
+        return {
+            "id": full["id"],
+            "name": full["name"],
+            "sizes": [_size_brief(s) for s in full["sizes"]],
+            "needs": [_need_brief(n) for n in full["needs"]],
+            "prescription_count": full["prescription_count"],
+        }
+
+    return _run(go)
+
+
+def set_size(
+    child: Annotated[str, Field(description="The child's first name.")],
+    category: Annotated[str, Field(description="What kind of size: shoes, pants, shirts, coat, diapers, hat...")],
+    value: Annotated[str, Field(description="The size as you'd say it: '13 toddler', '5T', 'youth M', 'size 4'.")],
+    notes: Annotated[str | None, Field(description="e.g. 'runs small in Nike'.")] = None,
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Record a child's current size in one category, like "Henry is a 13 in shoes now". Replaces the
+    old value for that category and notes who updated it and when, so later reads can say how old
+    the size is."""
+
+    def go():
+        with get_conn() as conn:
+            kid = _resolve_child(conn, child)
+            cat = _resolve_category(conn, category)
+        fresh = core.set_child_size(kid["id"], core.SizeIn(category=cat, value=value, notes=notes or ""), actor=_ACTOR)
+        return {"saved": True, "size": _size_brief(fresh), "message": f"{kid['name']}'s {cat.lower()} size is now {fresh['value']}."}
+
+    return _idempotent(idempotency_key, "set_size", lambda: _run(go))
+
+
+def list_sizes(
+    category: Annotated[str | None, Field(description="Only one kind, e.g. shoes. Leave empty for every size of every child.")] = None,
+) -> dict:
+    """Every child's current sizes, with how many days old each value is and a stale flag once it's
+    older than six months. For "what shoe sizes are the kids" before a shopping trip."""
+
+    def go():
+        with get_conn() as conn:
+            cat = _resolve_category(conn, category, must_exist=True) if category else None
+            items = kids.sizes(conn, category=cat)
+        stale = [s for s in items if s["stale"]]
+        return {
+            "sizes": [_size_brief(s) for s in items],
+            "stale_count": len(stale),
+            "message": (
+                "No sizes recorded yet." if not items
+                else f"{len(items)} size(s)." + (f" {len(stale)} are over {kids.STALE_SIZE_DAYS} days old and worth re-checking." if stale else "")
+            ),
+        }
+
+    return _run(go)
+
+
+def add_need(
+    child: Annotated[str, Field(description="Who needs it: the child's first name.")],
+    category: Annotated[str, Field(description="What they need: winter coat, rain boots, swimsuit, backpack...")],
+    season: Annotated[str | None, Field(description="Which season or occasion, e.g. 'winter 2026', 'back to school'.")] = None,
+    notes: Annotated[str | None, Field(description="Size, color, where to buy, anything useful.")] = None,
+    add_to_shopping: Annotated[bool, Field(description="Also put it on the shopping list.")] = False,
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Note that a child needs something, like "Ava needs a winter coat" or "the boys need rain boots
+    before fall". Stays open until someone marks it handled with mark_have. If the same need is already
+    open it's returned as a duplicate rather than added twice."""
+
+    def go():
+        with get_conn() as conn:
+            kid = _resolve_child(conn, child)
+            cat = _resolve_category(conn, category)
+        res = core.create_need(
+            core.NeedIn(child_id=kid["id"], category=cat, season=season or "", notes=notes or "", add_to_shopping=add_to_shopping),
+            Response(),
+            actor=_ACTOR,
+        )
+        if res["duplicate"]:
+            return {"created": False, "duplicate": True, "need": _need_brief(res), "message": f"{kid['name']} already needs {cat.lower()}; nothing was added."}
+        return {
+            "created": True,
+            "duplicate": False,
+            "need": _need_brief(res),
+            "message": f"Noted: {kid['name']} needs {cat.lower()}" + (f" for {season}" if season else "") + (". Added to the shopping list too." if add_to_shopping else "."),
+        }
+
+    return _idempotent(idempotency_key, "add_need", lambda: _run(go))
+
+
+def mark_have(
+    child: Annotated[str, Field(description="The child's first name.")],
+    category: Annotated[str, Field(description="Which need is handled, e.g. winter coat.")],
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Mark a child's need as handled, like "we got Ava's winter coat". Closes the open need (and
+    checks off its shopping-list item if it had one), recording who handled it."""
+
+    def go():
+        with get_conn() as conn:
+            kid = _resolve_child(conn, child)
+            cat = _resolve_category(conn, category, must_exist=True)
+            open_ = kids.needs(conn, kid["id"], cat)
+            if not open_:
+                have = kids.needs(conn, kid["id"], cat, status="have")
+                still = [n["category"] for n in kids.needs(conn, kid["id"])]
+                raise ToolError(
+                    f"{kid['name']} has no open need for {cat.lower()}"
+                    + (" (it was already marked handled)" if have else "")
+                    + (f". Still open: {', '.join(still)}." if still else ". Nothing is open for them.")
+                )
+            if len(open_) > 1:
+                raise _AmbiguousError(_disambiguation("need", f"{kid['name']}'s {cat.lower()}", [_need_brief(n) for n in open_]))
+        fresh = core.update_need(open_[0]["id"], core.NeedPatch(status="have"), actor=_ACTOR)
+        return {"handled": True, "need": _need_brief(fresh), "message": f"Marked {kid['name']}'s {cat.lower()} as handled."}
+
+    return _idempotent(idempotency_key, "mark_have", lambda: _run(go))
+
+
+def list_needs(
+    child: Annotated[str | None, Field(description="Only this child. Leave empty for all the kids.")] = None,
+    category: Annotated[str | None, Field(description="Only this kind of thing, e.g. shoes.")] = None,
+    season: Annotated[str | None, Field(description="Only this season, e.g. 'winter 2026'.")] = None,
+    status: Annotated[str | None, Field(description="needed (default), have, or all.")] = None,
+) -> dict:
+    """What the kids still need, oldest first, with how long each has been open. For "what do the kids
+    need" or "is Henry's coat handled" (use status 'all' to see handled ones)."""
+
+    def go():
+        want = (status or "needed").strip().lower()
+        if want not in (*kids.NEED_STATUSES, "all"):
+            raise ToolError(f"status should be needed, have or all, not '{status}'.")
+        with get_conn() as conn:
+            kid = _resolve_child(conn, child) if child else None
+            cat = _resolve_category(conn, category, must_exist=True) if category else None
+            items = kids.needs(conn, kid["id"] if kid else None, cat, season, want)
+        return {
+            "needs": [_need_brief(n) for n in items],
+            "message": "Nothing on the list." if not items else f"{len(items)} item(s).",
+        }
+
+    return _run(go)
+
+
+def seasonal_check(
+    categories: Annotated[list[str], Field(description="The kinds of things to check, e.g. ['winter coat', 'snow boots', 'gloves'].")],
+    season: Annotated[str, Field(description="The season this is for, e.g. 'winter 2026'.")],
+) -> dict:
+    """Go through every child at once for a season: "do all the kids have coats, boots and gloves for
+    winter?" One row per child per category with their current size (and how old it is) and whether
+    that need is open, handled, or was never recorded. Then use add_need for the gaps."""
+
+    def go():
+        if not categories:
+            raise ToolError("Give at least one category to check, e.g. ['winter coat', 'boots'].")
+        with get_conn() as conn:
+            cats = [_resolve_category(conn, c, prefer_existing=True) for c in categories if c.strip()]
+            rows = kids.seasonal_check(conn, cats, season.strip())
+        gaps = [r for r in rows if r["status"] != "have"]
+        return {
+            "season": season,
+            "rows": rows,
+            "gaps": len(gaps),
+            "message": (
+                "No children recorded yet." if not rows
+                else f"All set for {season}." if not gaps
+                else f"{len(gaps)} of {len(rows)} child/category pairs are not marked handled for {season}: "
+                + ", ".join(f"{r['child']} {r['category'].lower()} ({r['status']})" for r in gaps) + "."
+            ),
+        }
+
+    return _run(go)
 
 
 def list_pantry(

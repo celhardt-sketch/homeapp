@@ -13,9 +13,9 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from html import escape
 from pydantic import BaseModel, Field
-from typing import Union
+from typing import Literal, Union
 
-from . import auth, notify, oauth, refills
+from . import auth, kids, notify, oauth, refills
 from .db import get_conn, init_db
 from .matching import similarity
 from .seed import seed_if_empty
@@ -224,6 +224,30 @@ class ChildIn(BaseModel):
 class ChildPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=60)
     active: bool | None = None
+
+
+class SizeIn(BaseModel):
+    category: str = Field(min_length=1, max_length=60)
+    value: str = Field(min_length=1, max_length=60)
+    notes: str = Field(default="", max_length=300)
+
+
+class NeedIn(BaseModel):
+    child_id: int
+    category: str = Field(min_length=1, max_length=60)
+    season: str = Field(default="", max_length=40)
+    notes: str = Field(default="", max_length=300)
+    add_to_shopping: bool = False
+
+
+class NeedPatch(BaseModel):
+    status: Literal["needed", "have"] | None = None
+    notes: str | None = Field(default=None, max_length=300)
+
+
+class SeasonalCheckIn(BaseModel):
+    categories: list[str] = Field(min_length=1)
+    season: str = Field(min_length=1, max_length=40)
 
 
 class PrescriptionIn(BaseModel):
@@ -1248,6 +1272,107 @@ def update_child(child_id: int, body: ChildPatch):
             sets = ", ".join(f"{k} = ?" for k in fields)
             conn.execute(f"UPDATE children SET {sets} WHERE id = ?", (*fields.values(), child_id))
         return serialize_child(fetch_child_or_404(conn, child_id))
+
+
+# ---------- Children's sizes and needs (every named user; Claude too) ----------
+
+
+@app.get("/api/children/{child_id}", dependencies=MEMBER)
+def get_child(child_id: int):
+    """A child with their current sizes (each with age and a stale flag) and open needs."""
+    with get_conn() as conn:
+        c = fetch_child_or_404(conn, child_id)
+        return {
+            **serialize_child(c),
+            "sizes": kids.sizes(conn, child_id),
+            "needs": kids.needs(conn, child_id),
+            "prescription_count": conn.execute(
+                "SELECT COUNT(*) FROM prescriptions WHERE child_id = ? AND active = 1", (child_id,)
+            ).fetchone()[0],
+        }
+
+
+@app.get("/api/sizes", dependencies=MEMBER)
+def list_sizes(category: str | None = None):
+    with get_conn() as conn:
+        return kids.sizes(conn, category=kids.canonical_category(conn, category) if category else None)
+
+
+@app.put("/api/children/{child_id}/sizes", dependencies=MEMBER)
+def set_child_size(child_id: int, body: SizeIn, actor: Actor = ACTOR):
+    """Sets (or replaces) the child's current size in one category, recording who updated it."""
+    with get_conn() as conn:
+        fetch_child_or_404(conn, child_id)
+        cat = kids.canonical_category(conn, body.category)
+        return kids.set_size(conn, child_id, cat, body.value, body.notes, actor.attribution("Someone"), actor.user_id)
+
+
+@app.get("/api/needs", dependencies=MEMBER)
+def list_needs(child_id: int | None = None, category: str | None = None, season: str | None = None, status: str = "needed"):
+    if status not in (*kids.NEED_STATUSES, "all"):
+        raise HTTPException(400, f"status should be needed, have or all, not '{status}'")
+    with get_conn() as conn:
+        cat = kids.canonical_category(conn, category) if category else None
+        return kids.needs(conn, child_id, cat, season, status)
+
+
+@app.post("/api/needs", status_code=201, dependencies=MEMBER)
+def create_need(body: NeedIn, response: Response, actor: Actor = ACTOR):
+    """Records that a child needs something. An open need for the same child, category and season
+    is returned flagged as a duplicate (200) instead of being added twice."""
+    with get_conn() as conn:
+        child = fetch_child_or_404(conn, body.child_id)
+        cat = kids.canonical_category(conn, body.category)
+        season = body.season.strip()
+        dup = kids.open_need(conn, body.child_id, cat, season)
+        if dup:
+            response.status_code = 200
+            return {**dup, "duplicate": True}
+        shopping_id = None
+        if body.add_to_shopping:
+            label = f"{cat} for {child['name']}" + (f" ({season})" if season else "")
+            shopping_id = conn.execute(
+                "INSERT INTO shopping_items (name, notes, added_by, created_at) VALUES (?, ?, ?, ?)",
+                (label, body.notes.strip(), actor.attribution("Someone"), now_iso()),
+            ).lastrowid
+        cur = conn.execute(
+            "INSERT INTO child_needs (child_id, category, season, notes, shopping_item_id, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (body.child_id, cat, season, body.notes.strip(), shopping_id, now_iso(), actor.attribution("Someone")),
+        )
+        return {**kids.fetch_need(conn, cur.lastrowid), "duplicate": False}
+
+
+@app.patch("/api/needs/{need_id}", dependencies=MEMBER)
+def update_need(need_id: int, body: NeedPatch, actor: Actor = ACTOR):
+    """status 'have' marks it handled (recording who); 'needed' reopens it."""
+    with get_conn() as conn:
+        n = kids.fetch_need(conn, need_id)
+        if not n:
+            raise HTTPException(404, "Need not found")
+        if body.notes is not None:
+            conn.execute("UPDATE child_needs SET notes = ? WHERE id = ?", (body.notes.strip(), need_id))
+        if body.status == "have":
+            conn.execute(
+                "UPDATE child_needs SET status = 'have', resolved_at = ?, resolved_by = ? WHERE id = ?",
+                (now_iso(), actor.attribution("Someone"), need_id),
+            )
+            if n["shopping_item_id"]:
+                conn.execute(
+                    "UPDATE shopping_items SET bought_at = ?, bought_by = ? WHERE id = ? AND bought_at IS NULL",
+                    (now_iso(), actor.attribution("Someone"), n["shopping_item_id"]),
+                )
+        elif body.status == "needed":
+            conn.execute("UPDATE child_needs SET status = 'needed', resolved_at = NULL, resolved_by = '' WHERE id = ?", (need_id,))
+        return kids.fetch_need(conn, need_id)
+
+
+@app.post("/api/needs/seasonal-check", dependencies=MEMBER)
+def seasonal_check(body: SeasonalCheckIn):
+    """Every active child crossed with every category: current size (and its age) plus whether a
+    need for that season is open, handled, or never recorded."""
+    with get_conn() as conn:
+        cats = [kids.canonical_category(conn, c) for c in body.categories if c.strip()]
+        return kids.seasonal_check(conn, cats, body.season.strip())
 
 
 @app.get("/api/prescriptions", dependencies=MEMBER)
