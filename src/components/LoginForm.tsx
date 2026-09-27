@@ -27,7 +27,7 @@ export default function LoginForm({ onLogin }: { onLogin: (password: string) => 
         </span>
         <div>
           <h1 className="text-lg font-semibold">Household login</h1>
-          <p className="text-sm text-stone-500">Enter the house password once on this device to continue.</p>
+          <p className="text-sm text-stone-500">Enter the household password once on this device (or the admin password for full access).</p>
         </div>
       </div>
       <input

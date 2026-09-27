@@ -4,6 +4,7 @@ import { useUserName } from './useUserName'
 import { useAdminAuth } from './useAdminAuth'
 import NamePrompt from './components/NamePrompt'
 import LoginForm from './components/LoginForm'
+import AdminOnly from './components/AdminOnly'
 import HomePage from './pages/HomePage'
 import RoomPage from './pages/RoomPage'
 import AdminPage from './pages/AdminPage'
@@ -14,7 +15,9 @@ import UpkeepPage from './pages/UpkeepPage'
 
 export default function App() {
   const { name, setName } = useUserName()
-  const { loggedIn, login, logout } = useAdminAuth()
+  const { role, login, logout } = useAdminAuth()
+  const loggedIn = role !== null && role !== undefined
+  const isAdmin = role === 'admin'
 
   return (
     <div className="mx-auto flex min-h-screen max-w-xl flex-col">
@@ -32,17 +35,17 @@ export default function App() {
       </header>
 
       <main className="flex-1 px-4 pb-24 pt-4">
-        {loggedIn === null && <p className="text-center text-sm text-stone-500">Loading…</p>}
-        {loggedIn === false && <LoginForm onLogin={login} />}
+        {role === undefined && <p className="text-center text-sm text-stone-500">Loading…</p>}
+        {role === null && <LoginForm onLogin={login} />}
         {loggedIn && (
           <Routes>
-            <Route path="/" element={<HomePage />} />
+            <Route path="/" element={<HomePage isAdmin={isAdmin} />} />
             <Route path="/r/:slug" element={<RoomPage userName={name} />} />
             <Route path="/shopping" element={<ShoppingPage userName={name} />} />
             <Route path="/pantry" element={<PantryPage userName={name} />} />
-            <Route path="/meds" element={<MedsPage userName={name} />} />
+            <Route path="/meds" element={isAdmin ? <MedsPage userName={name} /> : <AdminOnly what="Medications" />} />
             <Route path="/upkeep" element={<UpkeepPage userName={name} />} />
-            <Route path="/admin" element={<AdminPage onLogout={logout} />} />
+            <Route path="/admin" element={<AdminPage isAdmin={isAdmin} onLogout={logout} />} />
             <Route path="*" element={<p className="text-center text-stone-500">Page not found.</p>} />
           </Routes>
         )}
