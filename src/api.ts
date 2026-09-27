@@ -93,10 +93,34 @@ export interface Pickup {
   reminder_sent_at: string | null
 }
 
+export interface UpkeepItem {
+  id: number
+  name: string
+  category: string
+  interval_days: number
+  notes: string
+  active: boolean
+  last_done_on: string | null
+  last_done_by: string | null
+  due_on: string | null
+  days_left: number | null
+  status: MedStatus
+}
+
+export interface UpkeepLog {
+  id: number
+  item_id: number
+  done_on: string
+  done_by: string
+  note: string
+  reminder_sent_at: string | null
+}
+
 export interface ReminderSettings {
   reminder_email: string
   email_configured: boolean
   due: { medication_id: number; name: string; person: string; reorder_on: string }[]
+  due_upkeep: { item_id: number; name: string; category: string; due_on: string }[]
 }
 
 const TOKEN_KEY = 'hm:adminToken'
@@ -188,6 +212,17 @@ export const api = {
     request<Medication>(`/api/medications/${id}/pickups`, { method: 'POST', body: JSON.stringify(body) }),
   pickupHistory: (id: number) => request<Pickup[]>(`/api/medications/${id}/pickups`),
   deletePickup: (id: number) => request<void>(`/api/pickups/${id}`, { method: 'DELETE' }),
+
+  upkeep: () => request<UpkeepItem[]>('/api/upkeep'),
+  createUpkeep: (body: { name: string; category?: string; interval_days: number; notes?: string; last_done_on?: string | null }) =>
+    request<UpkeepItem>('/api/upkeep', { method: 'POST', body: JSON.stringify(body) }),
+  updateUpkeep: (id: number, body: Partial<Pick<UpkeepItem, 'name' | 'category' | 'interval_days' | 'notes' | 'active'>>) =>
+    request<UpkeepItem>(`/api/upkeep/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteUpkeep: (id: number) => request<void>(`/api/upkeep/${id}`, { method: 'DELETE' }),
+  logUpkeep: (id: number, body: { done_on: string; done_by: string; note?: string }) =>
+    request<UpkeepItem>(`/api/upkeep/${id}/logs`, { method: 'POST', body: JSON.stringify(body) }),
+  upkeepHistory: (id: number) => request<UpkeepLog[]>(`/api/upkeep/${id}/logs`),
+  deleteUpkeepLog: (id: number) => request<void>(`/api/upkeep-logs/${id}`, { method: 'DELETE' }),
 
   reminderSettings: () => request<ReminderSettings>('/api/admin/reminders'),
   saveReminderSettings: (reminder_email: string) =>

@@ -47,9 +47,27 @@ DEFAULT_ROOMS = [
     },
 ]
 
+DEFAULT_UPKEEP = [
+    # (name, category, interval_days, notes)
+    ("Change HVAC / furnace filter", "HVAC", 90, "Check filter size on the old one before buying"),
+    ("Check car oil level & tire pressure", "Car", 30, ""),
+    ("Car oil change", "Car", 180, ""),
+    ("Clean window screens", "Exterior", 365, ""),
+    ("Clean gutters", "Exterior", 180, ""),
+    ("Test smoke & CO detectors", "Safety", 180, ""),
+    ("Flush water heater", "Plumbing", 365, ""),
+    ("Replace refrigerator water filter", "Appliances", 180, ""),
+]
+
 
 def seed_if_empty() -> None:
     with get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM settings WHERE key = 'upkeep_seeded'").fetchone():
+            conn.executemany(
+                "INSERT INTO upkeep_items (name, category, interval_days, notes) VALUES (?, ?, ?, ?)",
+                DEFAULT_UPKEEP,
+            )
+            conn.execute("INSERT INTO settings (key, value) VALUES ('upkeep_seeded', '1')")
         count = conn.execute("SELECT COUNT(*) FROM rooms").fetchone()[0]
         if count:
             return
