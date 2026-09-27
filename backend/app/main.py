@@ -1607,19 +1607,28 @@ def list_upkeep(include_inactive: bool = False):
         return [serialize_upkeep(conn, i) for i in rows]
 
 
+def _insert_upkeep(conn: sqlite3.Connection, body: UpkeepItemIn) -> dict:
+    name = " ".join(body.name.split())
+    rows = [dict(r) for r in conn.execute("SELECT * FROM upkeep_items WHERE active = 1")]
+    dup = _closest(name, rows)
+    if dup:
+        return {**serialize_upkeep(conn, fetch_upkeep_or_404(conn, dup["id"])), "duplicate": True, "duplicate_of": dup["name"]}
+    cur = conn.execute(
+        "INSERT INTO upkeep_items (name, category, interval_days, notes) VALUES (?, ?, ?, ?)",
+        (name, body.category.strip(), body.interval_days, body.notes.strip()),
+    )
+    if body.last_done_on:
+        conn.execute(
+            "INSERT INTO upkeep_logs (item_id, done_on) VALUES (?, ?)",
+            (cur.lastrowid, body.last_done_on.isoformat()),
+        )
+    return {**serialize_upkeep(conn, fetch_upkeep_or_404(conn, cur.lastrowid)), "duplicate": False}
+
+
 @app.post("/api/upkeep", status_code=201, dependencies=MEMBER)
 def create_upkeep(body: UpkeepItemIn):
     with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO upkeep_items (name, category, interval_days, notes) VALUES (?, ?, ?, ?)",
-            (body.name.strip(), body.category.strip(), body.interval_days, body.notes.strip()),
-        )
-        if body.last_done_on:
-            conn.execute(
-                "INSERT INTO upkeep_logs (item_id, done_on) VALUES (?, ?)",
-                (cur.lastrowid, body.last_done_on.isoformat()),
-            )
-        return serialize_upkeep(conn, fetch_upkeep_or_404(conn, cur.lastrowid))
+        return _insert_upkeep(conn, body)
 
 
 @app.patch("/api/upkeep/{item_id}", dependencies=MEMBER)

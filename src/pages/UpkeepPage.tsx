@@ -9,7 +9,8 @@ const STATUS_STYLE: Record<UpkeepItem['status'], string> = {
   due: 'bg-red-100 text-red-800',
 }
 
-const INTERVALS = [7, 14, 30, 60, 90, 180, 365, 730]
+const INTERVALS = [1, 7, 14, 30, 60, 90, 180, 365, 730]
+const QUICK_INTERVALS = [1, 7, 30, 365]
 
 function statusLabel(i: UpkeepItem): string {
   if (i.days_left === null) return 'Not logged yet'
@@ -282,10 +283,17 @@ function UpkeepForm({
     e.preventDefault()
     if (!name.trim() || intervalDays < 1) return
     try {
-      const saved = item
-        ? await api.updateUpkeep(item.id, { name, category, interval_days: intervalDays, notes })
-        : await api.createUpkeep({ name, category, interval_days: intervalDays, notes, last_done_on: lastDone || null })
-      onSaved(saved)
+      if (item) {
+        onSaved(await api.updateUpkeep(item.id, { name, category, interval_days: intervalDays, notes }))
+        return
+      }
+      const created = await api.createUpkeep({ name, category, interval_days: intervalDays, notes, last_done_on: lastDone || null })
+      if (created.duplicate) {
+        onError(`"${created.name}" is already on the list — edit that one instead.`)
+        onCancel()
+        return
+      }
+      onSaved(created)
     } catch (err) {
       onError((err as Error).message)
     }
@@ -308,9 +316,22 @@ function UpkeepForm({
           <option key={c} value={c} />
         ))}
       </datalist>
-      <label className="block text-xs font-medium text-stone-500">
-        Repeat every
-        <div className="mt-1 flex items-center gap-2">
+      <div className="text-xs font-medium text-stone-500">
+        Frequency
+        <div className="mt-1 flex flex-wrap gap-2">
+          {QUICK_INTERVALS.map((d) => (
+            <button
+              key={d}
+              type="button"
+              onClick={() => setIntervalDays(d)}
+              className={`rounded-full px-3 py-1.5 text-sm ${intervalDays === d ? 'bg-teal-700 text-white' : 'bg-stone-100 text-stone-700'}`}
+            >
+              {formatFrequency(d)}
+            </button>
+          ))}
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <span>Or every</span>
           <select
             value={isPreset ? intervalDays : 'custom'}
             onChange={(e) => e.target.value !== 'custom' && setIntervalDays(Number(e.target.value))}
@@ -333,7 +354,7 @@ function UpkeepForm({
           />
           <span className="text-sm text-stone-600">days</span>
         </div>
-      </label>
+      </div>
       {!item && (
         <label className="block text-xs font-medium text-stone-500">
           Last done (optional — sets the first reminder)
