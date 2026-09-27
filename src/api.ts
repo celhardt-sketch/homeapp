@@ -57,10 +57,26 @@ export interface ActivityItem extends Completion {
   room_slug: string
 }
 
+const TOKEN_KEY = 'hm:adminToken'
+
+export function getAdminToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY)
+}
+
+export function setAdminToken(token: string | null) {
+  if (token) localStorage.setItem(TOKEN_KEY, token)
+  else localStorage.removeItem(TOKEN_KEY)
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const token = getAdminToken()
   const res = await fetch(url, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers ?? {}),
+    },
   })
   if (!res.ok) {
     let detail = res.statusText
@@ -77,6 +93,15 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  adminLogin: (password: string) =>
+    request<{ token: string }>('/api/admin/login', { method: 'POST', body: JSON.stringify({ password }) }),
+  adminMe: () => request<{ ok: boolean }>('/api/admin/me'),
+  adminChangePassword: (current_password: string, new_password: string) =>
+    request<{ token: string }>('/api/admin/password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password, new_password }),
+    }),
+
   rooms: () => request<RoomSummary[]>('/api/rooms'),
   room: (slug: string) => request<Room>(`/api/rooms/${encodeURIComponent(slug)}`),
   createRoom: (body: { name: string; slug?: string; icon?: string }) =>

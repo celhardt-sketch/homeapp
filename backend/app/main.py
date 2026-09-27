@@ -4,11 +4,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import auth
 from .db import get_conn, init_db
 from .seed import seed_if_empty
 
@@ -19,6 +20,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 async def lifespan(_: FastAPI):
     init_db()
     seed_if_empty()
+    auth.ensure_admin_credentials()
     yield
 
 
@@ -77,6 +79,41 @@ class NoteIn(BaseModel):
 
 class NotePatch(BaseModel):
     resolved: bool
+
+
+class LoginIn(BaseModel):
+    password: str = Field(min_length=1, max_length=200)
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=4, max_length=200)
+
+
+ADMIN = [Depends(auth.require_admin)]
+
+
+# ---------- Admin auth ----------
+
+
+@app.post("/api/admin/login")
+def admin_login(body: LoginIn):
+    if not auth.check_password(body.password):
+        raise HTTPException(401, "Incorrect password")
+    return {"token": auth.issue_token()}
+
+
+@app.get("/api/admin/me", dependencies=ADMIN)
+def admin_me():
+    return {"ok": True}
+
+
+@app.post("/api/admin/password", dependencies=ADMIN)
+def admin_change_password(body: PasswordChangeIn):
+    if not auth.check_password(body.current_password):
+        raise HTTPException(401, "Current password is incorrect")
+    auth.set_password(body.new_password)
+    return {"token": auth.issue_token()}
 
 
 # ---------- Helpers ----------
@@ -178,7 +215,7 @@ def list_rooms():
         return [serialize_room(conn, r, with_tasks=False) for r in rows]
 
 
-@app.post("/api/rooms", status_code=201)
+@app.post("/api/rooms", status_code=201, dependencies=ADMIN)
 def create_room(body: RoomIn):
     slug = slugify(body.slug or body.name)
     with get_conn() as conn:
@@ -201,7 +238,7 @@ def get_room(slug: str):
         return serialize_room(conn, r, with_tasks=True)
 
 
-@app.patch("/api/rooms/{room_id}")
+@app.patch("/api/rooms/{room_id}", dependencies=ADMIN)
 def update_room(room_id: int, body: RoomPatch):
     with get_conn() as conn:
         fetch_room_or_404(conn, room_id)
@@ -221,7 +258,7 @@ def update_room(room_id: int, body: RoomPatch):
         return serialize_room(conn, fetch_room_or_404(conn, room_id), with_tasks=True)
 
 
-@app.delete("/api/rooms/{room_id}", status_code=204)
+@app.delete("/api/rooms/{room_id}", status_code=204, dependencies=ADMIN)
 def delete_room(room_id: int):
     with get_conn() as conn:
         fetch_room_or_404(conn, room_id)
@@ -231,7 +268,7 @@ def delete_room(room_id: int):
 # ---------- Tasks ----------
 
 
-@app.post("/api/tasks", status_code=201)
+@app.post("/api/tasks", status_code=201, dependencies=ADMIN)
 def create_task(body: TaskIn):
     with get_conn() as conn:
         fetch_room_or_404(conn, body.room_id)
@@ -245,7 +282,7 @@ def create_task(body: TaskIn):
         return serialize_task(conn, fetch_task_or_404(conn, cur.lastrowid))
 
 
-@app.patch("/api/tasks/{task_id}")
+@app.patch("/api/tasks/{task_id}", dependencies=ADMIN)
 def update_task(task_id: int, body: TaskPatch):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
@@ -262,7 +299,7 @@ def update_task(task_id: int, body: TaskPatch):
         return serialize_task(conn, fetch_task_or_404(conn, task_id))
 
 
-@app.delete("/api/tasks/{task_id}", status_code=204)
+@app.delete("/api/tasks/{task_id}", status_code=204, dependencies=ADMIN)
 def delete_task(task_id: int):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)

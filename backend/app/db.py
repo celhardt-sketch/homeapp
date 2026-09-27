@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS notes (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_notes_task ON notes(task_id, resolved);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
