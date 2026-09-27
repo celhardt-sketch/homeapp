@@ -146,6 +146,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE pantry_items ADD COLUMN par_level REAL")
         if "expires_on" not in pantry_cols:
             conn.execute("ALTER TABLE pantry_items ADD COLUMN expires_on TEXT")
+        conn.execute("UPDATE rooms SET name = 'Girls Room' WHERE name = 'GIrls Room'")
 
 
 @contextmanager

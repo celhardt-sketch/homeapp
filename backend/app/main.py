@@ -824,15 +824,17 @@ def serialize_upkeep(conn: sqlite3.Connection, i: sqlite3.Row) -> dict:
         "SELECT * FROM upkeep_logs WHERE item_id = ? ORDER BY done_on DESC, id DESC LIMIT 1",
         (i["id"],),
     ).fetchone()
-    due_on = None
-    days_left = None
-    status = "none"
     if last:
         due_date = date.fromisoformat(last["done_on"]) + timedelta(days=i["interval_days"])
-        due_on = due_date.isoformat()
         days_left = (due_date - date.today()).days
         soon_window = max(3, i["interval_days"] // 10)
         status = "due" if days_left <= 0 else "soon" if days_left <= soon_window else "ok"
+    else:
+        # Never logged: due now, so it surfaces until someone records it once.
+        due_date = date.today()
+        days_left = 0
+        status = "due"
+    due_on = due_date.isoformat()
     return {
         "id": i["id"],
         "name": i["name"],
