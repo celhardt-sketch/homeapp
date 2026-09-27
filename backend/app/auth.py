@@ -1,7 +1,8 @@
-"""Two-role password auth: `household` and `admin`.
+"""Role auth: `household` and `admin` log in with a password; `connector` is the MCP server
+(Claude) and authenticates with an OAuth access token issued by oauth.py.
 
 Password hashes and a random signing secret live in the `settings` table. On first start
-the passwords come from ADMIN_PASSWORD (default "admin") and HOUSEHOLD_PASSWORD (default "home").
+the passwords come from ADMIN_PASSWORD and HOUSEHOLD_PASSWORD (no defaults).
 Login returns a signed, expiring token carrying the role, sent back as `Authorization: Bearer <token>`.
 Household tokens are long-lived and renewed on every request (sliding window); admin tokens are short.
 """
@@ -16,11 +17,14 @@ import time
 
 from fastapi import HTTPException, Request
 
+from . import oauth
 from .db import get_conn
 
 ADMIN = "admin"
 HOUSEHOLD = "household"
-ROLES = (ADMIN, HOUSEHOLD)
+CONNECTOR = "connector"
+ROLES = (ADMIN, HOUSEHOLD)  # password roles
+ALL_ROLES = (ADMIN, HOUSEHOLD, CONNECTOR)
 TOKEN_TTL = {ADMIN: 60 * 60 * 24 * 30, HOUSEHOLD: 60 * 60 * 24 * 365}
 PASSWORD_KEY = {ADMIN: "admin_password_hash", HOUSEHOLD: "household_password_hash"}
 VERSION_KEY = {ADMIN: "admin_token_version", HOUSEHOLD: "household_token_version"}
@@ -146,10 +150,14 @@ def token_role(token: str) -> str | None:
 
 
 def authenticate(authorization: str | None) -> str:
-    """Return the role for a bearer header or raise 401."""
+    """Return the role for a bearer header or raise 401. Password-session tokens first,
+    then OAuth access tokens (connector role)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Login required")
-    role = token_role(authorization.removeprefix("Bearer ").strip())
+    token = authorization.removeprefix("Bearer ").strip()
+    role = token_role(token)
+    if role is None and oauth.access_token_valid(token):
+        role = CONNECTOR
     if role is None:
         raise HTTPException(401, "Session expired, please log in again")
     return role
@@ -160,8 +168,8 @@ def authenticate(authorization: str | None) -> str:
 
 
 def need_household(request: Request) -> None:
-    """Any logged-in role (household or admin)."""
-    if request.state.role not in ROLES:
+    """Any logged-in role (household, admin or connector)."""
+    if request.state.role not in ALL_ROLES:
         raise HTTPException(401, "Login required")
 
 

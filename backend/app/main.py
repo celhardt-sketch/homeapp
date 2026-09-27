@@ -7,13 +7,14 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from html import escape
 from pydantic import BaseModel, Field
 from typing import Union
 
-from . import auth, notify
+from . import auth, notify, oauth
 from .db import get_conn, init_db
 from .seed import seed_if_empty
 
@@ -31,7 +32,8 @@ async def lifespan(_: FastAPI):
         log.critical("%s", exc)
         raise
     reminder_task = asyncio.create_task(notify.reminder_loop())
-    yield
+    async with mcp_http.lifespan(mcp_http):
+        yield
     reminder_task.cancel()
 
 
@@ -228,6 +230,63 @@ def admin_change_password(body: PasswordChangeIn):
 def admin_set_household_password(body: HouseholdPasswordIn):
     auth.set_password(auth.HOUSEHOLD, body.new_password)
     return {"ok": True}
+
+
+# ---------- MCP connector (Claude) ----------
+# The connector role only ever holds OAuth tokens minted by oauth.py; revoking them here
+# does not touch household or admin sessions.
+
+
+@app.get("/api/admin/connector", dependencies=ADMIN)
+def connector_status():
+    return oauth.connector_status()
+
+
+@app.delete("/api/admin/connector", dependencies=ADMIN)
+def revoke_connector():
+    return {"revoked_tokens": oauth.revoke_all()}
+
+
+def _approve_page(req: dict, pending_id: str, error: str | None = None) -> HTMLResponse:
+    err = f'<p class="err">{escape(error)}</p>' if error else ""
+    return HTMLResponse(
+        f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect to Home</title>
+<style>body{{font-family:system-ui,sans-serif;background:#f5f5f4;margin:0;display:flex;justify-content:center;padding:2rem 1rem}}
+main{{background:#fff;border-radius:1rem;padding:1.5rem;max-width:26rem;width:100%;box-shadow:0 1px 3px rgba(0,0,0,.1)}}
+h1{{font-size:1.25rem;margin:0 0 .5rem}}p{{color:#57534e;font-size:.95rem}}ul{{color:#57534e;font-size:.9rem;padding-left:1.2rem}}
+input{{width:100%;box-sizing:border-box;padding:.6rem .75rem;border:1px solid #d6d3d1;border-radius:.5rem;font-size:1rem;margin:.25rem 0 1rem}}
+button{{padding:.6rem 1rem;border-radius:.5rem;border:0;font-size:1rem;cursor:pointer}}
+.ok{{background:#0f766e;color:#fff}}.no{{background:#e7e5e4;color:#292524;margin-left:.5rem}}.err{{color:#b91c1c}}</style></head>
+<body><main><h1>Let <b>{escape(req["client_name"])}</b> use Home?</h1>
+<p>It will be able to read and change rooms, tasks, upkeep, pantry and the shopping list as the <b>connector</b> role.
+It will <b>not</b> see medications or admin settings. You can revoke it any time from Manage.</p>
+{err}<form method="post"><input type="hidden" name="req" value="{escape(pending_id)}">
+<label>Admin password<input type="password" name="password" autofocus required></label>
+<button class="ok" name="decision" value="approve">Allow</button><button class="no" name="decision" value="deny">Cancel</button></form>
+</main></body></html>""",
+        status_code=401 if error else 200,
+    )
+
+
+@app.get(oauth.APPROVE_PATH, include_in_schema=False)
+def connector_approve_page(req: str):
+    pending = oauth.pending_request(req)
+    if not pending:
+        return HTMLResponse("<p>This connection request has expired. Start again from Claude.</p>", status_code=410)
+    return _approve_page(pending, req)
+
+
+@app.post(oauth.APPROVE_PATH, include_in_schema=False)
+def connector_approve(req: str = Form(), password: str = Form(default=""), decision: str = Form(default="approve")):
+    pending = oauth.pending_request(req)
+    if not pending:
+        return HTMLResponse("<p>This connection request has expired. Start again from Claude.</p>", status_code=410)
+    if decision != "approve":
+        return RedirectResponse(oauth.deny(req) or "/", status_code=303)
+    if not auth.check_password(auth.ADMIN, password):
+        return _approve_page(pending, req, "Incorrect admin password")
+    return RedirectResponse(oauth.approve(req) or "/", status_code=303)
 
 
 # ---------- Helpers ----------
@@ -973,6 +1032,18 @@ def status_summary():
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+# ---------- MCP server: /mcp plus OAuth endpoints (/authorize, /token, /register, /.well-known/*) ----------
+# Its routes go onto this app's router so they sit at the root path, ahead of the SPA catch-all.
+
+from .mcp_server import build_mcp  # noqa: E402  (needs the functions above)
+
+mcp = build_mcp()
+mcp_http = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
+app.router.routes.extend(mcp_http.routes)
+for mw in mcp_http.user_middleware:
+    app.add_middleware(mw.cls, *mw.args, **mw.kwargs)
 
 
 # ---------- Static frontend (production) ----------

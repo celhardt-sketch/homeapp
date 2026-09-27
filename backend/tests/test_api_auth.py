@@ -65,6 +65,8 @@ ADMIN_ONLY = [
     ("GET", "/api/admin/reminders", None),
     ("PUT", "/api/admin/reminders", {"reminder_email": ""}),
     ("POST", "/api/admin/reminders/test", None),
+    ("GET", "/api/admin/connector", None),
+    ("DELETE", "/api/admin/connector", None),
 ]
 
 ALL_PROTECTED = HOUSEHOLD_OK + ADMIN_ONLY + [("GET", "/api/some/future/route", None)]
@@ -90,6 +92,20 @@ def test_bad_token_is_401(client, method, path, body):
 def test_household_is_403_on_admin_routes(client, household_headers, method, path, body):
     r = client.request(method, path, json=body, headers=household_headers)
     assert r.status_code == 403, f"{method} {path} -> {r.status_code}"
+
+
+@pytest.mark.parametrize("method,path,body", ADMIN_ONLY, ids=_id)
+def test_connector_is_403_on_admin_routes(client, connector_headers, method, path, body):
+    """The MCP connector's OAuth token is rejected from medications, pickups and every /api/admin route."""
+    r = client.request(method, path, json=body, headers=connector_headers)
+    assert r.status_code == 403, f"{method} {path} -> {r.status_code}"
+
+
+@pytest.mark.parametrize("method,path,body", HOUSEHOLD_OK, ids=_id)
+def test_connector_is_not_rejected_on_household_routes(client, connector_headers, method, path, body):
+    r = client.request(method, path, json=body, headers=connector_headers)
+    assert r.status_code not in (401, 403), f"{method} {path} -> {r.status_code}"
+    assert SESSION_TOKEN_HEADER not in r.headers, "only household sessions slide"
 
 
 @pytest.mark.parametrize("method,path,body", HOUSEHOLD_OK, ids=_id)

@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Copy, KeyRound, LogOut, Mail, Nfc, Pencil, Plus, Trash2, X } from 'lucide-react'
-import { api, formatDay, formatFrequency, setAdminToken, type ReminderSettings, type Room, type RoomSummary, type Task } from '../api'
+import { Bot, Copy, KeyRound, LogOut, Mail, Nfc, Pencil, Plus, Trash2, X } from 'lucide-react'
+import {
+  api,
+  formatDay,
+  formatFrequency,
+  setAdminToken,
+  type ConnectorStatus,
+  type ReminderSettings,
+  type Room,
+  type RoomSummary,
+  type Task,
+} from '../api'
 import { ROOM_ICONS, RoomIcon } from '../icons'
 
 const FREQUENCIES: { label: string; value: number | null }[] = [
@@ -88,6 +98,7 @@ export default function AdminPage({ isAdmin, onLogout }: { isAdmin: boolean; onL
       )}
 
       {!selected && isAdmin && <ReminderSettingsCard />}
+      {!selected && isAdmin && <ConnectorCard />}
 
       {!selected ? (
         <>
@@ -141,6 +152,77 @@ export default function AdminPage({ isAdmin, onLogout }: { isAdmin: boolean; onL
         />
       )}
     </div>
+  )
+}
+
+function ConnectorCard() {
+  const [status, setStatus] = useState<ConnectorStatus | null>(null)
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  const load = useCallback(() => {
+    api
+      .connectorStatus()
+      .then(setStatus)
+      .catch((e: Error) => setMsg({ ok: false, text: e.message }))
+  }, [])
+  useEffect(load, [load])
+
+  async function revoke() {
+    if (!confirm('Disconnect Claude? Family devices and your admin login stay signed in.')) return
+    setMsg(null)
+    try {
+      const r = await api.revokeConnector()
+      setMsg({ ok: true, text: `Disconnected (${r.revoked_tokens} tokens revoked). Reconnect from Claude any time.` })
+      load()
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message })
+    }
+  }
+
+  function copyUrl() {
+    if (!status) return
+    navigator.clipboard.writeText(status.mcp_url).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    })
+  }
+
+  if (!status) return null
+
+  return (
+    <section className="rounded-xl bg-white p-4 shadow-sm">
+      <h2 className="mb-1 flex items-center gap-2 font-medium">
+        <Bot className="size-5 text-teal-700" /> Claude connector
+      </h2>
+      <p className="mb-2 text-sm text-stone-500">
+        Add this URL as a custom connector in Claude; it will ask for your admin password once. Claude gets its own
+        "connector" role: rooms, tasks, upkeep, pantry and shopping, never medications or settings.
+      </p>
+      <div className="mb-2 flex items-center gap-2">
+        <code className="flex-1 truncate rounded-lg bg-stone-100 px-2 py-1.5 text-xs">{status.mcp_url}</code>
+        <button onClick={copyUrl} className="rounded-lg border border-stone-300 p-1.5 text-stone-600" aria-label="Copy MCP URL">
+          <Copy className="size-4" />
+        </button>
+        {copied && <span className="text-xs text-teal-700">Copied</span>}
+      </div>
+      {status.connected ? (
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="rounded-full bg-green-50 px-2 py-0.5 text-xs text-green-700">
+            Connected: {status.clients.map((c) => c.client_name).join(', ')}
+          </span>
+          {status.last_used_at && <span className="text-xs text-stone-500">Last used {formatDay(status.last_used_at)}</span>}
+          <button onClick={revoke} className="ml-auto rounded-lg border border-red-200 px-3 py-1 text-sm text-red-700">
+            Disconnect Claude
+          </button>
+        </div>
+      ) : (
+        <p className="text-sm text-stone-500">Not connected yet.</p>
+      )}
+      {msg && (
+        <p className={`mt-2 rounded-lg p-2 text-sm ${msg.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>{msg.text}</p>
+      )}
+    </section>
   )
 }
 

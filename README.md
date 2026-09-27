@@ -34,6 +34,16 @@ Without either, reminders are still shown in the app.
 
 There are no default passwords. On first start the server sets the passwords from `ADMIN_PASSWORD` and `HOUSEHOLD_PASSWORD`; if either is missing (and no password is stored yet for that role) the server refuses to start and logs which variable is missing. Change them from the Manage page (key icon, admin only) — they then live in the database and the env vars are ignored. A stored password still equal to an old built-in default (`admin` / `home`) is treated as unset. Changing a password logs out every device using that role.
 
+## Claude connector (MCP)
+
+The server exposes a remote MCP server (Streamable HTTP) at `/mcp` so Claude can read and write rooms, tasks, upkeep, pantry and the shopping list. It runs in the same process and database as the app.
+
+- **Connect:** in Claude, add a custom connector with the URL shown on the Manage page (`https://<your-domain>/mcp`). Claude registers itself (OAuth 2.1 dynamic client registration + PKCE) and opens an approval page that asks for the **admin** password once. No static API keys.
+- **Role:** Claude acts as a third role, `connector` — same data as household, but it can never reach medications, pickups or `/api/admin/*`.
+- **Revoke:** Manage → "Claude connector" → Disconnect. This deletes only the connector's OAuth tokens; family devices and the admin login stay signed in.
+- **Public URL:** OAuth needs to know the public HTTPS address. On Railway this comes from `RAILWAY_PUBLIC_DOMAIN` automatically; elsewhere set `PUBLIC_URL=https://your-domain`.
+- Tools accept names as people say them ("jasmine rice", "the pink bathroom"); when a name could mean several things the tool returns `needs_disambiguation` and changes nothing. Writes accept an `idempotency_key`.
+
 ## Stack
 
 React 19 + Vite + Tailwind (frontend), FastAPI + SQLite (backend). In production a single container serves both.
