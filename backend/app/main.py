@@ -5,8 +5,8 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,6 +28,30 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Home Maintenance", lifespan=lifespan)
+
+PUBLIC_API_PATHS = frozenset({"/api/health", "/api/login"})
+SESSION_TOKEN_HEADER = "X-Session-Token"
+
+
+@app.middleware("http")
+async def require_login_for_api(request: Request, call_next):
+    """Deny-by-default: every /api route needs a valid session token unless allow-listed.
+
+    The role is stored on request.state for the per-route role dependencies. Household
+    sessions are sliding: a renewed token is returned on every request.
+    """
+    path = request.url.path.rstrip("/") or "/"
+    request.state.role = None
+    is_api = path == "/api" or path.startswith("/api/")
+    if is_api and path not in PUBLIC_API_PATHS:
+        try:
+            request.state.role = auth.authenticate(request.headers.get("authorization"))
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    response = await call_next(request)
+    if request.state.role == auth.HOUSEHOLD:
+        response.headers[SESSION_TOKEN_HEADER] = auth.issue_token(auth.HOUSEHOLD)
+    return response
 
 
 def now_iso() -> str:
@@ -93,6 +117,10 @@ class PasswordChangeIn(BaseModel):
     new_password: str = Field(min_length=4, max_length=200)
 
 
+class HouseholdPasswordIn(BaseModel):
+    new_password: str = Field(min_length=4, max_length=200)
+
+
 class PantryItemIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     category: str = Field(default="", max_length=60)
@@ -155,30 +183,39 @@ class ReminderSettingsIn(BaseModel):
     reminder_email: str = Field(max_length=200)
 
 
-ADMIN = [Depends(auth.require_admin)]
+# Every /api route declares exactly one of these (enforced by tests/test_api_auth.py).
+HOUSEHOLD = [Depends(auth.need_household)]  # household or admin
+ADMIN = [Depends(auth.need_admin)]  # admin only -> 403 for household
 
 
-# ---------- Admin auth ----------
+# ---------- Auth ----------
 
 
-@app.post("/api/admin/login")
-def admin_login(body: LoginIn):
-    if not auth.check_password(body.password):
+@app.post("/api/login")
+def login(body: LoginIn):
+    role = auth.role_for_password(body.password)
+    if role is None:
         raise HTTPException(401, "Incorrect password")
-    return {"token": auth.issue_token()}
+    return {"token": auth.issue_token(role), "role": role}
 
 
-@app.get("/api/admin/me", dependencies=ADMIN)
-def admin_me():
-    return {"ok": True}
+@app.get("/api/session", dependencies=HOUSEHOLD)
+def session(request: Request):
+    return {"role": request.state.role}
 
 
 @app.post("/api/admin/password", dependencies=ADMIN)
 def admin_change_password(body: PasswordChangeIn):
-    if not auth.check_password(body.current_password):
+    if not auth.check_password(auth.ADMIN, body.current_password):
         raise HTTPException(401, "Current password is incorrect")
-    auth.set_password(body.new_password)
-    return {"token": auth.issue_token()}
+    auth.set_password(auth.ADMIN, body.new_password)
+    return {"token": auth.issue_token(auth.ADMIN)}
+
+
+@app.put("/api/admin/household-password", dependencies=ADMIN)
+def admin_set_household_password(body: HouseholdPasswordIn):
+    auth.set_password(auth.HOUSEHOLD, body.new_password)
+    return {"ok": True}
 
 
 # ---------- Helpers ----------
@@ -273,14 +310,14 @@ def fetch_task_or_404(conn: sqlite3.Connection, task_id: int) -> sqlite3.Row:
 # ---------- Rooms ----------
 
 
-@app.get("/api/rooms")
+@app.get("/api/rooms", dependencies=HOUSEHOLD)
 def list_rooms():
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM rooms ORDER BY sort_order, id").fetchall()
         return [serialize_room(conn, r, with_tasks=False) for r in rows]
 
 
-@app.post("/api/rooms", status_code=201, dependencies=ADMIN)
+@app.post("/api/rooms", status_code=201, dependencies=HOUSEHOLD)
 def create_room(body: RoomIn):
     slug = slugify(body.slug or body.name)
     with get_conn() as conn:
@@ -294,7 +331,7 @@ def create_room(body: RoomIn):
         return serialize_room(conn, fetch_room_or_404(conn, cur.lastrowid), with_tasks=True)
 
 
-@app.get("/api/rooms/{slug}")
+@app.get("/api/rooms/{slug}", dependencies=HOUSEHOLD)
 def get_room(slug: str):
     with get_conn() as conn:
         r = conn.execute("SELECT * FROM rooms WHERE slug = ?", (slug,)).fetchone()
@@ -303,7 +340,7 @@ def get_room(slug: str):
         return serialize_room(conn, r, with_tasks=True)
 
 
-@app.patch("/api/rooms/{room_id}", dependencies=ADMIN)
+@app.patch("/api/rooms/{room_id}", dependencies=HOUSEHOLD)
 def update_room(room_id: int, body: RoomPatch):
     with get_conn() as conn:
         fetch_room_or_404(conn, room_id)
@@ -333,7 +370,7 @@ def delete_room(room_id: int):
 # ---------- Tasks ----------
 
 
-@app.post("/api/tasks", status_code=201, dependencies=ADMIN)
+@app.post("/api/tasks", status_code=201, dependencies=HOUSEHOLD)
 def create_task(body: TaskIn):
     with get_conn() as conn:
         fetch_room_or_404(conn, body.room_id)
@@ -347,7 +384,7 @@ def create_task(body: TaskIn):
         return serialize_task(conn, fetch_task_or_404(conn, cur.lastrowid))
 
 
-@app.patch("/api/tasks/{task_id}", dependencies=ADMIN)
+@app.patch("/api/tasks/{task_id}", dependencies=HOUSEHOLD)
 def update_task(task_id: int, body: TaskPatch):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
@@ -364,14 +401,14 @@ def update_task(task_id: int, body: TaskPatch):
         return serialize_task(conn, fetch_task_or_404(conn, task_id))
 
 
-@app.delete("/api/tasks/{task_id}", status_code=204, dependencies=ADMIN)
+@app.delete("/api/tasks/{task_id}", status_code=204, dependencies=HOUSEHOLD)
 def delete_task(task_id: int):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
 
 
-@app.post("/api/tasks/{task_id}/complete", status_code=201)
+@app.post("/api/tasks/{task_id}/complete", status_code=201, dependencies=HOUSEHOLD)
 def complete_task(task_id: int, body: CompleteIn):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
@@ -382,7 +419,7 @@ def complete_task(task_id: int, body: CompleteIn):
         return serialize_task(conn, fetch_task_or_404(conn, task_id))
 
 
-@app.delete("/api/completions/{completion_id}", status_code=204)
+@app.delete("/api/completions/{completion_id}", status_code=204, dependencies=HOUSEHOLD)
 def undo_completion(completion_id: int):
     with get_conn() as conn:
         c = conn.execute("SELECT * FROM completions WHERE id = ?", (completion_id,)).fetchone()
@@ -391,7 +428,7 @@ def undo_completion(completion_id: int):
         conn.execute("DELETE FROM completions WHERE id = ?", (completion_id,))
 
 
-@app.get("/api/tasks/{task_id}/history")
+@app.get("/api/tasks/{task_id}/history", dependencies=HOUSEHOLD)
 def task_history(task_id: int, limit: int = 50):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
@@ -405,7 +442,7 @@ def task_history(task_id: int, limit: int = 50):
 # ---------- Notes ----------
 
 
-@app.post("/api/tasks/{task_id}/notes", status_code=201)
+@app.post("/api/tasks/{task_id}/notes", status_code=201, dependencies=HOUSEHOLD)
 def add_note(task_id: int, body: NoteIn):
     with get_conn() as conn:
         fetch_task_or_404(conn, task_id)
@@ -417,7 +454,7 @@ def add_note(task_id: int, body: NoteIn):
         return serialize_note(n)
 
 
-@app.patch("/api/notes/{note_id}")
+@app.patch("/api/notes/{note_id}", dependencies=HOUSEHOLD)
 def update_note(note_id: int, body: NotePatch):
     with get_conn() as conn:
         n = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
@@ -427,7 +464,7 @@ def update_note(note_id: int, body: NotePatch):
         return serialize_note(conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone())
 
 
-@app.get("/api/shopping")
+@app.get("/api/shopping", dependencies=HOUSEHOLD)
 def shopping_list():
     with get_conn() as conn:
         rows = conn.execute(
@@ -446,7 +483,7 @@ def shopping_list():
         ]
 
 
-@app.get("/api/activity")
+@app.get("/api/activity", dependencies=ADMIN)
 def recent_activity(limit: int = 30):
     with get_conn() as conn:
         rows = conn.execute(
@@ -469,14 +506,14 @@ def serialize_pantry(r: sqlite3.Row) -> dict:
     return {**dict(r), "low": bool(r["low"])}
 
 
-@app.get("/api/pantry")
+@app.get("/api/pantry", dependencies=HOUSEHOLD)
 def list_pantry():
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM pantry_items ORDER BY category, name").fetchall()
         return [serialize_pantry(r) for r in rows]
 
 
-@app.post("/api/pantry", status_code=201)
+@app.post("/api/pantry", status_code=201, dependencies=HOUSEHOLD)
 def create_pantry_item(body: PantryItemIn):
     with get_conn() as conn:
         cur = conn.execute(
@@ -486,7 +523,7 @@ def create_pantry_item(body: PantryItemIn):
         return serialize_pantry(conn.execute("SELECT * FROM pantry_items WHERE id = ?", (cur.lastrowid,)).fetchone())
 
 
-@app.patch("/api/pantry/{item_id}")
+@app.patch("/api/pantry/{item_id}", dependencies=HOUSEHOLD)
 def update_pantry_item(item_id: int, body: PantryItemPatch):
     with get_conn() as conn:
         if not conn.execute("SELECT 1 FROM pantry_items WHERE id = ?", (item_id,)).fetchone():
@@ -504,7 +541,7 @@ def update_pantry_item(item_id: int, body: PantryItemPatch):
         return serialize_pantry(conn.execute("SELECT * FROM pantry_items WHERE id = ?", (item_id,)).fetchone())
 
 
-@app.delete("/api/pantry/{item_id}", status_code=204)
+@app.delete("/api/pantry/{item_id}", status_code=204, dependencies=HOUSEHOLD)
 def delete_pantry_item(item_id: int):
     with get_conn() as conn:
         if not conn.execute("SELECT 1 FROM pantry_items WHERE id = ?", (item_id,)).fetchone():
@@ -552,7 +589,7 @@ def fetch_med_or_404(conn: sqlite3.Connection, med_id: int) -> sqlite3.Row:
     return m
 
 
-@app.get("/api/medications")
+@app.get("/api/medications", dependencies=ADMIN)
 def list_medications(include_inactive: bool = False):
     with get_conn() as conn:
         where = "" if include_inactive else "WHERE active = 1"
@@ -560,7 +597,7 @@ def list_medications(include_inactive: bool = False):
         return [serialize_medication(conn, m) for m in rows]
 
 
-@app.post("/api/medications", status_code=201)
+@app.post("/api/medications", status_code=201, dependencies=ADMIN)
 def create_medication(body: MedicationIn):
     with get_conn() as conn:
         cur = conn.execute(
@@ -570,7 +607,7 @@ def create_medication(body: MedicationIn):
         return serialize_medication(conn, fetch_med_or_404(conn, cur.lastrowid))
 
 
-@app.patch("/api/medications/{med_id}")
+@app.patch("/api/medications/{med_id}", dependencies=ADMIN)
 def update_medication(med_id: int, body: MedicationPatch):
     with get_conn() as conn:
         fetch_med_or_404(conn, med_id)
@@ -586,14 +623,14 @@ def update_medication(med_id: int, body: MedicationPatch):
         return serialize_medication(conn, fetch_med_or_404(conn, med_id))
 
 
-@app.delete("/api/medications/{med_id}", status_code=204)
+@app.delete("/api/medications/{med_id}", status_code=204, dependencies=ADMIN)
 def delete_medication(med_id: int):
     with get_conn() as conn:
         fetch_med_or_404(conn, med_id)
         conn.execute("DELETE FROM medications WHERE id = ?", (med_id,))
 
 
-@app.post("/api/medications/{med_id}/pickups", status_code=201)
+@app.post("/api/medications/{med_id}/pickups", status_code=201, dependencies=ADMIN)
 def log_pickup(med_id: int, body: PickupIn):
     with get_conn() as conn:
         fetch_med_or_404(conn, med_id)
@@ -604,7 +641,7 @@ def log_pickup(med_id: int, body: PickupIn):
         return serialize_medication(conn, fetch_med_or_404(conn, med_id))
 
 
-@app.get("/api/medications/{med_id}/pickups")
+@app.get("/api/medications/{med_id}/pickups", dependencies=ADMIN)
 def pickup_history(med_id: int, limit: int = 50):
     with get_conn() as conn:
         fetch_med_or_404(conn, med_id)
@@ -615,7 +652,7 @@ def pickup_history(med_id: int, limit: int = 50):
         return [dict(r) for r in rows]
 
 
-@app.delete("/api/pickups/{pickup_id}", status_code=204)
+@app.delete("/api/pickups/{pickup_id}", status_code=204, dependencies=ADMIN)
 def delete_pickup(pickup_id: int):
     with get_conn() as conn:
         if not conn.execute("SELECT 1 FROM med_pickups WHERE id = ?", (pickup_id,)).fetchone():
@@ -662,7 +699,7 @@ def fetch_upkeep_or_404(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row:
     return i
 
 
-@app.get("/api/upkeep")
+@app.get("/api/upkeep", dependencies=HOUSEHOLD)
 def list_upkeep(include_inactive: bool = False):
     with get_conn() as conn:
         where = "" if include_inactive else "WHERE active = 1"
@@ -670,7 +707,7 @@ def list_upkeep(include_inactive: bool = False):
         return [serialize_upkeep(conn, i) for i in rows]
 
 
-@app.post("/api/upkeep", status_code=201)
+@app.post("/api/upkeep", status_code=201, dependencies=HOUSEHOLD)
 def create_upkeep(body: UpkeepItemIn):
     with get_conn() as conn:
         cur = conn.execute(
@@ -685,7 +722,7 @@ def create_upkeep(body: UpkeepItemIn):
         return serialize_upkeep(conn, fetch_upkeep_or_404(conn, cur.lastrowid))
 
 
-@app.patch("/api/upkeep/{item_id}")
+@app.patch("/api/upkeep/{item_id}", dependencies=HOUSEHOLD)
 def update_upkeep(item_id: int, body: UpkeepItemPatch):
     with get_conn() as conn:
         fetch_upkeep_or_404(conn, item_id)
@@ -701,14 +738,14 @@ def update_upkeep(item_id: int, body: UpkeepItemPatch):
         return serialize_upkeep(conn, fetch_upkeep_or_404(conn, item_id))
 
 
-@app.delete("/api/upkeep/{item_id}", status_code=204)
+@app.delete("/api/upkeep/{item_id}", status_code=204, dependencies=HOUSEHOLD)
 def delete_upkeep(item_id: int):
     with get_conn() as conn:
         fetch_upkeep_or_404(conn, item_id)
         conn.execute("DELETE FROM upkeep_items WHERE id = ?", (item_id,))
 
 
-@app.post("/api/upkeep/{item_id}/logs", status_code=201)
+@app.post("/api/upkeep/{item_id}/logs", status_code=201, dependencies=HOUSEHOLD)
 def log_upkeep(item_id: int, body: UpkeepLogIn):
     with get_conn() as conn:
         fetch_upkeep_or_404(conn, item_id)
@@ -719,7 +756,7 @@ def log_upkeep(item_id: int, body: UpkeepLogIn):
         return serialize_upkeep(conn, fetch_upkeep_or_404(conn, item_id))
 
 
-@app.get("/api/upkeep/{item_id}/logs")
+@app.get("/api/upkeep/{item_id}/logs", dependencies=HOUSEHOLD)
 def upkeep_history(item_id: int, limit: int = 50):
     with get_conn() as conn:
         fetch_upkeep_or_404(conn, item_id)
@@ -730,7 +767,7 @@ def upkeep_history(item_id: int, limit: int = 50):
         return [dict(r) for r in rows]
 
 
-@app.delete("/api/upkeep-logs/{log_id}", status_code=204)
+@app.delete("/api/upkeep-logs/{log_id}", status_code=204, dependencies=HOUSEHOLD)
 def delete_upkeep_log(log_id: int):
     with get_conn() as conn:
         if not conn.execute("SELECT 1 FROM upkeep_logs WHERE id = ?", (log_id,)).fetchone():

@@ -6,7 +6,9 @@ Web app for tracking recurring maintenance tasks per room, opened by scanning an
 - Scanning the tag opens the room's task list. Tap the circle to check a task off; the app records **who** did it (name saved on the device, asked once) and **when**.
 - Tasks have a frequency (daily, weekly, monthly, …) and show Due / Overdue based on the last completion.
 - Notes can be added to a task, optionally flagged "something needs to be purchased" — those show up on the **To Buy** page.
-- **Manage** page (password-protected admin panel): add/edit/delete rooms and tasks, copy each room's NFC link, change the admin password. Checking off tasks and adding notes does not require login.
+- The whole app is behind a password with two roles (see below). Every `/api/*` route except `/api/health` and `/api/login` returns 401 without a valid session token (deny-by-default middleware, so new routes are protected automatically); each route also declares the role it needs, and a household session on an admin-only route gets 403.
+- NFC tags only ever point at a room *page* (`/r/<slug>`). Nothing is written from a URL alone — checking a task off is a POST made by a tap inside the app.
+- **Manage** page: add/edit rooms and tasks, copy each room's NFC link; admin also deletes rooms, sets both passwords and reminder settings.
 
 - **Upkeep** page: house-wide recurring jobs not tied to a room (HVAC filter, car oil change, window screens, gutters…). Each has a repeat interval; "Mark done" logs who/when and schedules the next reminder, shown in-app (Home page banner + Upkeep tab) and emailed.
 - **Pantry** page: track what's stocked; mark items "low" and they appear on To Buy.
@@ -21,9 +23,15 @@ The server checks hourly for medications past their reorder date and upkeep jobs
 
 Without either, reminders are still shown in the app.
 
-## Admin password
+## Passwords and roles
 
-The first time the server starts it sets the admin password from the `ADMIN_PASSWORD` environment variable (default `admin`). Change it from the Manage page (key icon) — the stored password then lives in the database and `ADMIN_PASSWORD` is no longer consulted.
+| | Household | Admin |
+|---|---|---|
+| Rooms, tasks, completions, notes, upkeep, pantry, shopping | read + write | read + write |
+| Delete rooms, activity feed, medications, pickups, `/api/admin/*`, passwords | — (403) | yes |
+| Session | 365 days, sliding (renewed on every request) | 30 days |
+
+On first start the server sets the passwords from `ADMIN_PASSWORD` (default `admin`) and `HOUSEHOLD_PASSWORD` (default `home`). Change them from the Manage page (key icon, admin only) — they then live in the database and the env vars are no longer consulted. Changing a password logs out every device using that role.
 
 ## Stack
 
@@ -36,6 +44,8 @@ React 19 + Vite + Tailwind (frontend), FastAPI + SQLite (backend). In production
 cd backend
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 DATA_DIR=~/hm-data .venv/bin/uvicorn app.main:app --reload --port 8000
+# tests (auth coverage of every /api route):
+.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pytest
 
 # frontend (port 5173, proxies /api to the backend)
 npm install
@@ -46,4 +56,4 @@ npm run dev
 
 ## Deploy (Railway or any Docker host)
 
-The `Dockerfile` builds the frontend and serves it from FastAPI. Mount a persistent volume at `/data` (or set `DATA_DIR`) so the SQLite database survives redeploys. Set `ADMIN_PASSWORD` before the first start to pick the initial admin password. The server listens on `$PORT` (default 8000).
+The `Dockerfile` builds the frontend and serves it from FastAPI. Mount a persistent volume at `/data` (or set `DATA_DIR`) so the SQLite database survives redeploys. Set `ADMIN_PASSWORD` and `HOUSEHOLD_PASSWORD` before the first start to pick the initial passwords. The server listens on `$PORT` (default 8000).

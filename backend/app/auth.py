@@ -1,8 +1,9 @@
-"""Single-admin password auth.
+"""Two-role password auth: `household` and `admin`.
 
-The admin password hash and a random signing secret live in the `settings` table.
-On first start the password comes from ADMIN_PASSWORD (default "admin").
-Login returns a signed, expiring token sent back as `Authorization: Bearer <token>`.
+Password hashes and a random signing secret live in the `settings` table. On first start
+the passwords come from ADMIN_PASSWORD (default "admin") and HOUSEHOLD_PASSWORD (default "home").
+Login returns a signed, expiring token carrying the role, sent back as `Authorization: Bearer <token>`.
+Household tokens are long-lived and renewed on every request (sliding window); admin tokens are short.
 """
 
 import base64
@@ -13,11 +14,16 @@ import os
 import secrets
 import time
 
-from fastapi import Header, HTTPException
+from fastapi import HTTPException, Request
 
 from .db import get_conn
 
-TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
+ADMIN = "admin"
+HOUSEHOLD = "household"
+ROLES = (ADMIN, HOUSEHOLD)
+TOKEN_TTL = {ADMIN: 60 * 60 * 24 * 30, HOUSEHOLD: 60 * 60 * 24 * 365}
+PASSWORD_KEY = {ADMIN: "admin_password_hash", HOUSEHOLD: "household_password_hash"}
+VERSION_KEY = {ADMIN: "admin_token_version", HOUSEHOLD: "household_token_version"}
 PBKDF2_ITERATIONS = 200_000
 
 
@@ -46,8 +52,10 @@ def verify_password(password: str, stored: str) -> bool:
 
 def ensure_admin_credentials() -> None:
     with get_conn() as conn:
-        if _get_setting(conn, "admin_password_hash") is None:
-            _set_setting(conn, "admin_password_hash", hash_password(os.environ.get("ADMIN_PASSWORD", "admin")))
+        if _get_setting(conn, PASSWORD_KEY[ADMIN]) is None:
+            _set_setting(conn, PASSWORD_KEY[ADMIN], hash_password(os.environ.get("ADMIN_PASSWORD", "admin")))
+        if _get_setting(conn, PASSWORD_KEY[HOUSEHOLD]) is None:
+            _set_setting(conn, PASSWORD_KEY[HOUSEHOLD], hash_password(os.environ.get("HOUSEHOLD_PASSWORD", "home")))
         if _get_setting(conn, "token_secret") is None:
             _set_setting(conn, "token_secret", secrets.token_hex(32))
 
@@ -64,42 +72,79 @@ def _sign(payload: str, secret: str) -> str:
     return _b64(hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest())
 
 
-def issue_token() -> str:
+def issue_token(role: str) -> str:
+    assert role in ROLES
     with get_conn() as conn:
         secret = _get_setting(conn, "token_secret") or ""
-    payload = _b64(json.dumps({"exp": int(time.time()) + TOKEN_TTL_SECONDS}).encode())
+        version = _get_setting(conn, VERSION_KEY[role]) or "0"
+    payload = _b64(json.dumps({"role": role, "v": version, "exp": int(time.time()) + TOKEN_TTL[role]}).encode())
     return f"{payload}.{_sign(payload, secret)}"
 
 
-def check_password(password: str) -> bool:
+def check_password(role: str, password: str) -> bool:
     with get_conn() as conn:
-        stored = _get_setting(conn, "admin_password_hash")
+        stored = _get_setting(conn, PASSWORD_KEY[role])
     return bool(stored) and verify_password(password, stored)
 
 
-def set_password(new_password: str) -> None:
+def role_for_password(password: str) -> str | None:
+    """Admin is checked first so the two passwords can never collide into the weaker role."""
+    for role in ROLES:
+        if check_password(role, password):
+            return role
+    return None
+
+
+def set_password(role: str, new_password: str) -> None:
+    """Changing a role's password invalidates every existing session of that role."""
     with get_conn() as conn:
-        _set_setting(conn, "admin_password_hash", hash_password(new_password))
-        _set_setting(conn, "token_secret", secrets.token_hex(32))
+        _set_setting(conn, PASSWORD_KEY[role], hash_password(new_password))
+        _set_setting(conn, VERSION_KEY[role], secrets.token_hex(8))
 
 
-def _token_valid(token: str) -> bool:
+def token_role(token: str) -> str | None:
+    """Role carried by a valid, unexpired token; None otherwise."""
     try:
         payload, sig = token.split(".", 1)
     except ValueError:
-        return False
+        return None
     with get_conn() as conn:
         secret = _get_setting(conn, "token_secret") or ""
+        versions = {role: _get_setting(conn, VERSION_KEY[role]) or "0" for role in ROLES}
     if not hmac.compare_digest(_sign(payload, secret), sig):
-        return False
+        return None
     try:
-        return json.loads(_unb64(payload))["exp"] > time.time()
+        data = json.loads(_unb64(payload))
+        if data["exp"] > time.time() and data["role"] in ROLES and data["v"] == versions[data["role"]]:
+            return data["role"]
     except (ValueError, KeyError, TypeError):
-        return False
+        pass
+    return None
 
 
-def require_admin(authorization: str | None = Header(default=None)) -> None:
+def authenticate(authorization: str | None) -> str:
+    """Return the role for a bearer header or raise 401."""
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Admin login required")
-    if not _token_valid(authorization.removeprefix("Bearer ").strip()):
+        raise HTTPException(401, "Login required")
+    role = token_role(authorization.removeprefix("Bearer ").strip())
+    if role is None:
         raise HTTPException(401, "Session expired, please log in again")
+    return role
+
+
+# Route-level role declarations. The middleware in main.py already guarantees a valid session
+# (request.state.role); these only decide *which* role may use the route.
+
+
+def need_household(request: Request) -> None:
+    """Any logged-in role (household or admin)."""
+    if request.state.role not in ROLES:
+        raise HTTPException(401, "Login required")
+
+
+def need_admin(request: Request) -> None:
+    if request.state.role != ADMIN:
+        raise HTTPException(403, "Admin access required")
+
+
+ROLE_DEPENDENCIES = (need_household, need_admin)

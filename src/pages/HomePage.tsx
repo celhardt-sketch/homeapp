@@ -4,7 +4,7 @@ import { ChevronRight, StickyNote, Wrench } from 'lucide-react'
 import { api, formatDate, formatDay, type ActivityItem, type RoomSummary, type UpkeepItem } from '../api'
 import { RoomIcon } from '../icons'
 
-export default function HomePage() {
+export default function HomePage({ isAdmin }: { isAdmin: boolean }) {
   const [rooms, setRooms] = useState<RoomSummary[] | null>(null)
   const [activity, setActivity] = useState<ActivityItem[]>([])
   const [upkeepDue, setUpkeepDue] = useState<UpkeepItem[]>([])
@@ -12,12 +12,12 @@ export default function HomePage() {
 
   useEffect(() => {
     api.rooms().then(setRooms).catch((e: Error) => setError(e.message))
-    api.activity().then(setActivity).catch(() => {})
+    if (isAdmin) api.activity().then(setActivity).catch(() => {})
     api
       .upkeep()
       .then((items) => setUpkeepDue(items.filter((i) => i.status === 'due' || i.status === 'soon').sort((a, b) => (a.days_left ?? 0) - (b.days_left ?? 0))))
       .catch(() => {})
-  }, [])
+  }, [isAdmin])
 
   if (error) return <p className="text-red-700">Couldn't load rooms: {error}</p>
   if (!rooms) return <p className="text-stone-500">Loading…</p>

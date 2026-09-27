@@ -123,7 +123,20 @@ export interface ReminderSettings {
   due_upkeep: { item_id: number; name: string; category: string; due_on: string }[]
 }
 
+export type Role = 'admin' | 'household'
+
 const TOKEN_KEY = 'hm:adminToken'
+export const SESSION_EXPIRED_EVENT = 'hm:session-expired'
+// 401 from these means "wrong password typed", not an expired session.
+const PASSWORD_ROUTES = new Set(['/api/login', '/api/admin/password'])
+
+export class ApiError extends Error {
+  status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.status = status
+  }
+}
 
 export function getAdminToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
@@ -145,6 +158,10 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     },
   })
   if (!res.ok) {
+    if (res.status === 401 && token && !PASSWORD_ROUTES.has(url)) {
+      setAdminToken(null)
+      window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT))
+    }
     let detail = res.statusText
     try {
       const body = await res.json()
@@ -152,16 +169,21 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     } catch {
       /* ignore */
     }
-    throw new Error(detail)
+    throw new ApiError(detail, res.status)
   }
+  // Household sessions slide: the server hands back a renewed token on every request.
+  const renewed = res.headers.get('X-Session-Token')
+  if (renewed) setAdminToken(renewed)
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
 }
 
 export const api = {
-  adminLogin: (password: string) =>
-    request<{ token: string }>('/api/admin/login', { method: 'POST', body: JSON.stringify({ password }) }),
-  adminMe: () => request<{ ok: boolean }>('/api/admin/me'),
+  login: (password: string) =>
+    request<{ token: string; role: Role }>('/api/login', { method: 'POST', body: JSON.stringify({ password }) }),
+  session: () => request<{ role: Role }>('/api/session'),
+  setHouseholdPassword: (new_password: string) =>
+    request<{ ok: boolean }>('/api/admin/household-password', { method: 'PUT', body: JSON.stringify({ new_password }) }),
   adminChangePassword: (current_password: string, new_password: string) =>
     request<{ token: string }>('/api/admin/password', {
       method: 'POST',
