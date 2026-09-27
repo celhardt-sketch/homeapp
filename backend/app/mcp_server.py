@@ -1,7 +1,7 @@
 """MCP server (Streamable HTTP at /mcp) so Claude can read and write the home app.
 
 Runs inside the FastAPI process and calls the same functions as the REST API, as the
-`connector` role: rooms, tasks, upkeep, pantry, shopping and status. No medication tools.
+`connector` role: rooms, tasks, upkeep, pantry, shopping, prescription refills and status.
 
 Every identifier argument accepts an id or a spoken name; see matching.py. When several
 rows plausibly match, a tool returns {"needs_disambiguation": true, "candidates": [...]}
@@ -21,7 +21,7 @@ from fastmcp.exceptions import ToolError
 from pydantic import Field
 
 from . import main as core
-from . import oauth
+from . import oauth, refills
 from .db import get_conn
 from .matching import Ambiguous, Match, NoMatch, resolve, similarity
 
@@ -63,6 +63,11 @@ def build_mcp() -> FastMCP:
             add_to_shopping,
             add_to_list,
             list_for_person,
+            list_refills,
+            log_pickup,
+            mark_called,
+            list_prescriptions,
+            add_prescription,
             find,
         ],
     )
@@ -551,6 +556,211 @@ def log_upkeep_done(
         return {"logged": True, "item": fresh}
 
     return _idempotent(idempotency_key, "log_upkeep_done", lambda: _run(go))
+
+
+# ---------- prescription refills ----------
+
+
+def _all_children(conn) -> list[dict]:
+    return [core.serialize_child(c) for c in conn.execute("SELECT * FROM children WHERE active = 1 ORDER BY name")]
+
+
+def _resolve_child(conn, child: str) -> dict:
+    kids = _all_children(conn)
+    res = resolve(child, kids)
+    if isinstance(res, Match):
+        return res.item
+    if isinstance(res, Ambiguous):
+        raise _AmbiguousError(_disambiguation("child", child, [{"id": c["id"], "name": c["name"]} for c in res.candidates]))
+    raise _no_match("child", child, res.nearest, [c["name"] for c in kids])
+
+
+def _rx_brief(p: dict) -> dict:
+    return {
+        "id": p["id"],
+        "child": p["child"],
+        "name": p["name"],
+        "refill_status": p["refill_status"],
+        "days_since_pickup": p["days_since_pickup"],
+        "days_of_supply_left": p["days_of_supply_left"],
+        "last_picked_up_on": p["last_picked_up_on"],
+        "pharmacy": p["pharmacy"],
+        "contact_name": p["contact_name"],
+        "contact_phone": p["contact_phone"],
+        "assignee": p["assignee"],
+    }
+
+
+def _resolve_prescription(conn, child: str, prescription: str | None) -> dict:
+    """The child is resolved first, then the prescription within that child's list. A child with
+    several prescriptions and no prescription named is a disambiguation, never a guess."""
+    kid = _resolve_child(conn, child)
+    rxs = [p for p in refills.active_prescriptions(conn) if p["child_id"] == kid["id"]]
+    if not rxs:
+        raise ToolError(f"{kid['name']} has no active prescriptions.")
+    if not prescription:
+        if len(rxs) == 1:
+            return rxs[0]
+        raise _AmbiguousError(_disambiguation("prescription", f"{kid['name']}'s", [_rx_brief(p) for p in rxs]))
+    res = resolve(prescription, rxs)
+    if isinstance(res, Match):
+        return res.item
+    if isinstance(res, Ambiguous):
+        raise _AmbiguousError(_disambiguation("prescription", prescription, [_rx_brief(p) for p in res.candidates]))
+    raise _no_match("prescription", prescription, res.nearest, [f"{p['name']} ({kid['name']})" for p in rxs])
+
+
+def list_refills(
+    status: Annotated[
+        str | None,
+        Field(description="refill_due, urgent, called_waiting, ok, or 'all'. Default: refill_due and urgent only."),
+    ] = None,
+) -> dict:
+    """Which of the kids' prescriptions need a refill call right now. Controlled prescriptions can't be
+    refilled before day 28 and a 30-day supply runs out at day 30, so this is the list to act on;
+    urgent means the supply is already gone. Items stay on this list until a pickup is logged."""
+    with get_conn() as conn:
+        items = refills.active_prescriptions(conn)
+    wanted = (status or "").strip().lower().replace(" ", "_")
+    if wanted in ("", "due"):
+        items = [p for p in items if p["refill_status"] in refills.DUE_STATUSES]
+    elif wanted != "all":
+        items = [p for p in items if p["refill_status"] == wanted]
+    items.sort(key=lambda p: (p["days_of_supply_left"] if p["days_of_supply_left"] is not None else 999, p["child"]))
+    urgent = sum(1 for p in items if p["refill_status"] == "urgent")
+    return {
+        "items": [_rx_brief(p) for p in items],
+        "urgent_count": urgent,
+        "message": (
+            "No refills need attention right now."
+            if not items
+            else f"{len(items)} prescription(s) need attention" + (f", {urgent} already out of supply." if urgent else ".")
+        ),
+    }
+
+
+def log_pickup(
+    child: Annotated[str, Field(description="Whose prescription: the child's first name.")],
+    prescription: Annotated[
+        str | None, Field(description="Which prescription (name or id). Can be left out only if the child has exactly one.")
+    ] = None,
+    picked_up_on: Annotated[str | None, Field(description="Date it was picked up, YYYY-MM-DD. Defaults to today.")] = None,
+    notes: Annotated[str | None, Field(description="Anything worth remembering.")] = None,
+    override: Annotated[bool, Field(description="Set true to log a second pickup on the same day on purpose.")] = False,
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Record that a prescription was picked up, like "I picked up Henry's meds today". Restarts the
+    28-day clock and clears any 'called' state. If the child has more than one prescription and none
+    is named, asks which one instead of guessing."""
+
+    def go():
+        when = _parse_date(picked_up_on, "picked_up_on") or date.today()
+        with get_conn() as conn:
+            rx = _resolve_prescription(conn, child, prescription)
+        fresh = core.log_pickup(rx["id"], core.RefillPickupIn(picked_up_on=when, notes=notes or "", override=override), actor=_ACTOR)
+        return {
+            "logged": True,
+            "prescription": _rx_brief(fresh),
+            "message": f"Logged {fresh['name']} for {fresh['child']} picked up {when.isoformat()}. Next refill window opens in {fresh['refill_after_days'] - fresh['days_since_pickup']} day(s).",
+        }
+
+    return _idempotent(idempotency_key, "log_pickup", lambda: _run(go))
+
+
+def mark_called(
+    child: Annotated[str, Field(description="Whose prescription: the child's first name.")],
+    prescription: Annotated[str | None, Field(description="Which prescription (name or id). Optional if the child has one.")] = None,
+    notes: Annotated[str | None, Field(description="e.g. 'pharmacy says ready Thursday'.")] = None,
+) -> dict:
+    """Note that someone already called the pharmacy or the prescriber about a refill, like "I called
+    about Henry's refill". Quiets the reminder for two days; it comes back if no pickup is logged.
+    Does not quiet an urgent (out of supply) reminder."""
+
+    def go():
+        with get_conn() as conn:
+            rx = _resolve_prescription(conn, child, prescription)
+        fresh = core.mark_called(rx["id"], core.CalledIn(notes=notes or ""), actor=_ACTOR)
+        quiet = fresh["refill_status"] == "called_waiting"
+        return {
+            "called": True,
+            "prescription": _rx_brief(fresh),
+            "message": f"Noted the call about {fresh['name']} for {fresh['child']}. "
+            + ("The reminder is quiet for two days." if quiet else "It's still urgent, so the reminder stays on." if fresh["refill_status"] == "urgent" else ""),
+        }
+
+    return _run(go)
+
+
+def list_prescriptions(
+    child: Annotated[str | None, Field(description="Only this child's prescriptions. Leave empty for everyone.")] = None,
+) -> list[dict]:
+    """All the kids' active prescriptions with pharmacy, who to call, days since pickup and refill
+    status. For "what does Henry take" or "who do we call about Ava's refill"."""
+
+    def go():
+        with get_conn() as conn:
+            items = refills.active_prescriptions(conn)
+            if child:
+                kid = _resolve_child(conn, child)
+                items = [p for p in items if p["child_id"] == kid["id"]]
+        return [_rx_brief(p) for p in items]
+
+    return _run(go)
+
+
+def add_prescription(
+    child: Annotated[str, Field(description="The child's first name. A new child is created if unknown.")],
+    name: Annotated[str, Field(description="The prescription name as written on the bottle.")],
+    pharmacy: Annotated[str | None, Field(description="Where it's filled.")] = None,
+    contact_name: Annotated[str | None, Field(description="Who to call about refills (pharmacy or prescriber's office).")] = None,
+    contact_phone: Annotated[str | None, Field(description="Their phone number.")] = None,
+    days_supply: Annotated[int | None, Field(description="Days each fill lasts. Default 30.")] = None,
+    refill_after_days: Annotated[int | None, Field(description="Earliest day a refill is allowed. Default 28.")] = None,
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Start tracking a prescription, like "add Henry's Focalin, 30-day supply, refill after 28 days,
+    call Dr. Lee's office at 555-0100". If the child isn't known yet they are added."""
+
+    def go():
+        with get_conn() as conn:
+            kids = _all_children(conn)
+            res = resolve(child, kids)
+            if isinstance(res, Ambiguous):
+                raise _AmbiguousError(_disambiguation("child", child, [{"id": c["id"], "name": c["name"]} for c in res.candidates]))
+            kid = res.item if isinstance(res, Match) else None
+            existing = (
+                [p for p in refills.active_prescriptions(conn) if p["child_id"] == kid["id"] and similarity(name, p["name"]) >= 0.9]
+                if kid
+                else []
+            )
+        if kid is None:
+            kid = core.create_child(core.ChildIn(name=child.strip()))
+        if existing:
+            return {
+                "created": False,
+                "duplicate": True,
+                "prescription": _rx_brief(existing[0]),
+                "message": f"{kid['name']} already has {existing[0]['name']}; nothing was added.",
+            }
+        fresh = core.create_prescription(
+            core.PrescriptionIn(
+                child_id=kid["id"],
+                name=name,
+                pharmacy=pharmacy or "",
+                contact_name=contact_name or "",
+                contact_phone=contact_phone or "",
+                days_supply=days_supply or 30,
+                refill_after_days=refill_after_days or 28,
+            )
+        )
+        return {
+            "created": True,
+            "duplicate": False,
+            "prescription": _rx_brief(fresh),
+            "message": f"Added {fresh['name']} for {fresh['child']}. Log the first pickup so the refill clock starts.",
+        }
+
+    return _idempotent(idempotency_key, "add_prescription", lambda: _run(go))
 
 
 def list_pantry(

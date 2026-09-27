@@ -95,6 +95,39 @@ CREATE TABLE IF NOT EXISTS med_pickups (
 );
 CREATE INDEX IF NOT EXISTS idx_med_pickups ON med_pickups(medication_id, picked_up_on DESC);
 
+CREATE TABLE IF NOT EXISTS children (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS prescriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    child_id INTEGER NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    pharmacy TEXT NOT NULL DEFAULT '',
+    contact_name TEXT NOT NULL DEFAULT '',
+    contact_phone TEXT NOT NULL DEFAULT '',
+    days_supply INTEGER NOT NULL DEFAULT 30,
+    refill_after_days INTEGER NOT NULL DEFAULT 28,
+    active INTEGER NOT NULL DEFAULT 1,
+    notes TEXT NOT NULL DEFAULT '',
+    assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    called_on TEXT,
+    called_by TEXT NOT NULL DEFAULT '',
+    called_notes TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS pickups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prescription_id INTEGER NOT NULL REFERENCES prescriptions(id) ON DELETE CASCADE,
+    picked_up_on TEXT NOT NULL,
+    picked_up_by TEXT NOT NULL DEFAULT '',
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    notes TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_pickups ON pickups(prescription_id, picked_up_on DESC);
+
 CREATE TABLE IF NOT EXISTS upkeep_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -248,6 +281,29 @@ def init_db() -> None:
         for table in ("completions", "upkeep_logs"):
             if "user_id" not in _cols(conn, table):
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL")
+        _migrate_medications_to_prescriptions(conn)
+
+
+def _migrate_medications_to_prescriptions(conn: sqlite3.Connection) -> None:
+    """One-time copy of the old medications/med_pickups rows into children/prescriptions/pickups.
+    The old tables are left in place, unused."""
+    if conn.execute("SELECT COUNT(*) FROM prescriptions").fetchone()[0]:
+        return
+    meds = conn.execute("SELECT * FROM medications ORDER BY id").fetchall()
+    if not meds:
+        return
+    for m in meds:
+        child = conn.execute("SELECT id FROM children WHERE lower(name) = lower(?)", (m["person"],)).fetchone()
+        child_id = child["id"] if child else conn.execute("INSERT INTO children (name) VALUES (?)", (m["person"],)).lastrowid
+        cur = conn.execute(
+            "INSERT INTO prescriptions (child_id, name, refill_after_days, days_supply, active, notes) VALUES (?, ?, ?, ?, ?, ?)",
+            (child_id, m["name"], m["reorder_days"], max(30, m["reorder_days"]), m["active"], m["notes"]),
+        )
+        conn.execute(
+            "INSERT INTO pickups (prescription_id, picked_up_on, picked_up_by) "
+            "SELECT ?, picked_up_on, picked_up_by FROM med_pickups WHERE medication_id = ? ORDER BY picked_up_on, id",
+            (cur.lastrowid, m["id"]),
+        )
 
 
 @contextmanager

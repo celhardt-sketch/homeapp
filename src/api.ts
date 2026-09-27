@@ -157,28 +157,58 @@ export type PantryCreated = PantryItem & { duplicate: boolean; requested_name?: 
 
 export type MedStatus = 'none' | 'ok' | 'soon' | 'due'
 
-export interface Medication {
+export interface Child {
   id: number
   name: string
-  person: string
-  reorder_days: number
-  notes: string
   active: boolean
+}
+
+/** Derived from the latest pickup on every read; `called_waiting` is the manual "I called, waiting" state. */
+export type RefillStatus = 'no_pickup' | 'ok' | 'refill_due' | 'called_waiting' | 'urgent'
+
+export interface Prescription {
+  id: number
+  child_id: number
+  child: string
+  name: string
+  pharmacy: string
+  contact_name: string
+  contact_phone: string
+  days_supply: number
+  refill_after_days: number
+  active: boolean
+  notes: string
+  assignee_id: number | null
+  assignee: string | null
   last_picked_up_on: string | null
   last_picked_up_by: string | null
-  last_pickup_id: number | null
-  reminder_sent_at: string | null
-  reorder_on: string | null
-  days_left: number | null
-  status: MedStatus
+  days_since_pickup: number | null
+  days_of_supply_left: number | null
+  refill_status: RefillStatus
+  called_on: string | null
+  called_by: string
+  called_notes: string
+}
+
+export interface PrescriptionInput {
+  child_id: number
+  name: string
+  pharmacy?: string
+  contact_name?: string
+  contact_phone?: string
+  days_supply?: number
+  refill_after_days?: number
+  notes?: string
+  assignee_id?: number | null
 }
 
 export interface Pickup {
   id: number
-  medication_id: number
+  prescription_id: number
   picked_up_on: string
   picked_up_by: string
-  reminder_sent_at: string | null
+  user_id: number | null
+  notes: string
 }
 
 export interface UpkeepItem {
@@ -215,7 +245,8 @@ export interface ConnectorStatus {
 export interface ReminderSettings {
   reminder_email: string
   email_configured: boolean
-  due: { medication_id: number; name: string; person: string; reorder_on: string }[]
+  refill_detail_in_notifications: boolean
+  due_refills: Prescription[]
   due_upkeep: { item_id: number; name: string; category: string; due_on: string }[]
 }
 
@@ -346,15 +377,22 @@ export const api = {
     request<PantryItem>(`/api/pantry/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deletePantryItem: (id: number) => request<void>(`/api/pantry/${id}`, { method: 'DELETE' }),
 
-  medications: () => request<Medication[]>('/api/medications'),
-  createMedication: (body: { name: string; person: string; reorder_days: number; notes?: string }) =>
-    request<Medication>('/api/medications', { method: 'POST', body: JSON.stringify(body) }),
-  updateMedication: (id: number, body: Partial<Pick<Medication, 'name' | 'person' | 'reorder_days' | 'notes' | 'active'>>) =>
-    request<Medication>(`/api/medications/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-  deleteMedication: (id: number) => request<void>(`/api/medications/${id}`, { method: 'DELETE' }),
-  logPickup: (id: number, body: { picked_up_on: string; picked_up_by: string }) =>
-    request<Medication>(`/api/medications/${id}/pickups`, { method: 'POST', body: JSON.stringify(body) }),
-  pickupHistory: (id: number) => request<Pickup[]>(`/api/medications/${id}/pickups`),
+  children: (includeInactive = false) => request<Child[]>(`/api/children${includeInactive ? '?include_inactive=true' : ''}`),
+  createChild: (name: string) => request<Child>('/api/children', { method: 'POST', body: JSON.stringify({ name }) }),
+  updateChild: (id: number, body: Partial<Pick<Child, 'name' | 'active'>>) =>
+    request<Child>(`/api/children/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  prescriptions: (includeInactive = false) =>
+    request<Prescription[]>(`/api/prescriptions${includeInactive ? '?include_inactive=true' : ''}`),
+  refillsDue: () => request<Prescription[]>('/api/refills'),
+  createPrescription: (body: PrescriptionInput) =>
+    request<Prescription>('/api/prescriptions', { method: 'POST', body: JSON.stringify(body) }),
+  updatePrescription: (id: number, body: Partial<PrescriptionInput> & { active?: boolean }) =>
+    request<Prescription>(`/api/prescriptions/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  logPickup: (id: number, body: { picked_up_on: string; notes?: string; override?: boolean }) =>
+    request<Prescription>(`/api/prescriptions/${id}/pickups`, { method: 'POST', body: JSON.stringify(body) }),
+  pickupHistory: (id: number) => request<Pickup[]>(`/api/prescriptions/${id}/pickups`),
+  markCalled: (id: number, notes = '') =>
+    request<Prescription>(`/api/prescriptions/${id}/called`, { method: 'POST', body: JSON.stringify({ notes }) }),
   deletePickup: (id: number) => request<void>(`/api/pickups/${id}`, { method: 'DELETE' }),
 
   upkeep: () => request<UpkeepItem[]>('/api/upkeep'),
@@ -371,8 +409,11 @@ export const api = {
   connectorStatus: () => request<ConnectorStatus>('/api/admin/connector'),
   revokeConnector: () => request<{ revoked_tokens: number }>('/api/admin/connector', { method: 'DELETE' }),
   reminderSettings: () => request<ReminderSettings>('/api/admin/reminders'),
-  saveReminderSettings: (reminder_email: string) =>
-    request<ReminderSettings>('/api/admin/reminders', { method: 'PUT', body: JSON.stringify({ reminder_email }) }),
+  saveReminderSettings: (reminder_email: string, refill_detail_in_notifications?: boolean) =>
+    request<ReminderSettings>('/api/admin/reminders', {
+      method: 'PUT',
+      body: JSON.stringify({ reminder_email, refill_detail_in_notifications }),
+    }),
   sendTestReminder: () => request<{ ok: boolean }>('/api/admin/reminders/test', { method: 'POST' }),
 }
 

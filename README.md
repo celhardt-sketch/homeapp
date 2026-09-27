@@ -13,12 +13,12 @@ Web app for tracking recurring maintenance tasks per room, opened by scanning an
 
 - **Upkeep** page: house-wide recurring jobs not tied to a room (HVAC filter, car oil change, window screens, gutters…). Each has a repeat interval; "Mark done" logs who/when and schedules the next reminder, shown in-app (Home page banner + Upkeep tab) and emailed.
 - **Pantry** page: track what's stocked; mark items "low" and they appear on To Buy. An optional **par level** makes an item low automatically when its quantity (leading number, e.g. `2 bags`) is at or below it; an optional expiry date flags items expiring within a week. "Add many" adds a whole grocery run in one request. Adding a name that closely matches an existing item (case-insensitive, substring, or a typo) returns the existing item flagged `duplicate` instead of creating a second row.
-- `GET /api/status` (readable by every member) summarises tasks overdue / due today / due within 7 days, upkeep due, pantry below par and pantry expiring within 7 days. It never includes medication data (enforced by a test).
-- **Meds** page: log each prescription pickup (date + who for). A reorder reminder is due 28 days later (adjustable), shown in-app and emailed.
+- `GET /api/status` (readable by every member) summarises tasks overdue / due today / due within 7 days, upkeep due, pantry below par and pantry expiring within 7 days. Its `refills` section lists only prescriptions that are `refill_due` or `urgent` (child, prescription name, days of supply left) — no pharmacy, contacts, notes or pickup history (enforced by a test).
+- **Refills** page: prescription refill tracking only — no dosing, schedules or administration logs. Admins add children and prescriptions (pharmacy, who to call and their number, days of supply, default 30, refill allowed after day 28). Anyone logs a pickup (attributed to the logged-in person; a second pickup on the same day is refused unless overridden). Status is derived from the latest pickup: `ok` → `refill_due` at day 28 → `urgent` once the supply is out. A due item stays on the list until a pickup is logged; "I called, waiting" quiets ordinary reminders for two days (never urgent). Reminders go in-app to Courtney and the assigned person daily while due and say only "Refill due for <child>, open the app" unless the admin toggle for full detail is on.
 
 ## Reminder emails
 
-The server checks hourly for medications past their reorder date and upkeep jobs past their due date, and emails the address set on the Manage page (or `REMINDER_EMAIL`). Configure one provider via environment variables:
+The server checks hourly for refills due (in-app notifications, daily) and upkeep jobs past their due date, and emails the address set on the Manage page (or `REMINDER_EMAIL`). Configure one provider via environment variables:
 
 - Resend: `RESEND_API_KEY` (and optionally `REMINDER_FROM`, default `onboarding@resend.dev` which only delivers to your own Resend account email until you verify a domain).
 - SMTP (e.g. Gmail app password): `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASS`, optional `REMINDER_FROM`.
@@ -31,17 +31,19 @@ Without either, reminders are still shown in the app.
 |---|---|---|
 | Tasks, completions, notes, upkeep, pantry, shopping, `/api/status`, everyone's lists | read + write (own items; can't reassign) | read + write |
 | Add / rename / archive / delete rooms | — (403) | yes (also the Claude connector) |
-| Activity feed, medications, pickups, people, `/api/admin/*` | — (403) | yes |
+| Refills: read, log pickups, mark called | yes | yes |
+| Add / edit / deactivate children and prescriptions | — (403) | yes |
+| Activity feed, people, `/api/admin/*` | — (403) | yes |
 | Session | 365 days, sliding (renewed on every request) | 30 days |
 
 Accounts are created on first start from `HOME_USERS` (default `Courtney:admin,Magnus:admin,Susan,Vanessa`) with a password per person from `PASSWORD_<NAME>` (e.g. `PASSWORD_SUSAN`). There are no default passwords: if a listed person has no account yet and no password variable, the server refuses to start and logs which variable is missing. Upgrading from the old shared passwords: admins inherit the stored admin password and members the stored household password, so nothing needs to be set. Everyone can change their own password from the Manage page; admins can add people, reset passwords and remove people. Changing someone's password logs out their devices only.
 
 ## Claude connector (MCP)
 
-The server exposes a remote MCP server (Streamable HTTP) at `/mcp` so Claude can read and write rooms, tasks, upkeep, pantry and the shopping list. It runs in the same process and database as the app.
+The server exposes a remote MCP server (Streamable HTTP) at `/mcp` so Claude can read and write rooms, tasks, upkeep, pantry, the shopping list and prescription refills. It runs in the same process and database as the app.
 
 - **Connect:** in Claude, add a custom connector with the URL shown on the Manage page (`https://<your-domain>/mcp`). Claude registers itself (OAuth 2.1 dynamic client registration + PKCE) and opens an approval page that asks for the **admin** password once. No static API keys.
-- **Role:** Claude acts as a third role, `connector` — same data as a member plus room management, but it can never reach medications, pickups or `/api/admin/*`.
+- **Role:** Claude acts as a third role, `connector` — same data as a member plus room management and the refill tools, but it can never reach `/api/admin/*`.
 - **Revoke:** Manage → "Claude connector" → Disconnect. This deletes only the connector's OAuth tokens; everyone's devices stay signed in.
 - **Public URL:** OAuth needs to know the public HTTPS address. On Railway this comes from `RAILWAY_PUBLIC_DOMAIN` automatically; elsewhere set `PUBLIC_URL=https://your-domain`.
 - Tools accept names as people say them ("jasmine rice", "the pink bathroom"); when a name could mean several things the tool returns `needs_disambiguation` and changes nothing. Writes accept an `idempotency_key`.

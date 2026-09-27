@@ -4,13 +4,12 @@ import { Bell, Home, ListChecks, Package, Pill, Settings, ShoppingCart, Wrench }
 import { api, formatDate, type Notification } from './api'
 import { useAdminAuth } from './useAdminAuth'
 import LoginForm from './components/LoginForm'
-import AdminOnly from './components/AdminOnly'
 import HomePage from './pages/HomePage'
 import RoomPage from './pages/RoomPage'
 import AdminPage from './pages/AdminPage'
 import ShoppingPage from './pages/ShoppingPage'
 import PantryPage from './pages/PantryPage'
-import MedsPage from './pages/MedsPage'
+import RefillsPage from './pages/RefillsPage'
 import UpkeepPage from './pages/UpkeepPage'
 import MyListPage from './pages/MyListPage'
 
@@ -40,7 +39,8 @@ export default function App() {
             <Route path="/r/:slug" element={<RoomPage userName={name} />} />
             <Route path="/shopping" element={<ShoppingPage userName={name} canAssign={isAdmin} myUserId={user?.id ?? null} />} />
             <Route path="/pantry" element={<PantryPage userName={name} />} />
-            <Route path="/meds" element={isAdmin ? <MedsPage userName={name} /> : <AdminOnly what="Medications" />} />
+            <Route path="/refills" element={<RefillsPage isAdmin={isAdmin} />} />
+            <Route path="/meds" element={<RefillsPage isAdmin={isAdmin} />} />
             <Route path="/upkeep" element={<UpkeepPage userName={name} />} />
             <Route path="/admin" element={<AdminPage session={session} onLogout={logout} />} />
             <Route path="*" element={<p className="text-center text-stone-500">Page not found.</p>} />
@@ -54,7 +54,7 @@ export default function App() {
           <Tab to="/rooms" icon={<Home className="size-5" />} label="Rooms" />
           <Tab to="/upkeep" icon={<Wrench className="size-5" />} label="Upkeep" />
           <Tab to="/pantry" icon={<Package className="size-5" />} label="Pantry" />
-          <Tab to="/meds" icon={<Pill className="size-5" />} label="Meds" />
+          <Tab to="/refills" icon={<Pill className="size-5" />} label="Refills" />
           <Tab to="/shopping" icon={<ShoppingCart className="size-5" />} label="To Buy" />
           <Tab to="/admin" icon={<Settings className="size-5" />} label="Manage" />
         </div>

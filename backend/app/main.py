@@ -15,7 +15,7 @@ from html import escape
 from pydantic import BaseModel, Field
 from typing import Union
 
-from . import auth, notify, oauth
+from . import auth, notify, oauth, refills
 from .db import get_conn, init_db
 from .seed import seed_if_empty
 
@@ -216,24 +216,48 @@ class PantryItemPatch(BaseModel):
     updated_by: str = Field(default="", max_length=60)
 
 
-class MedicationIn(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    person: str = Field(min_length=1, max_length=60)
-    reorder_days: int = Field(default=28, ge=1, le=365)
-    notes: str = Field(default="", max_length=500)
+class ChildIn(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
 
 
-class MedicationPatch(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=120)
-    person: str | None = Field(default=None, min_length=1, max_length=60)
-    reorder_days: int | None = Field(default=None, ge=1, le=365)
-    notes: str | None = Field(default=None, max_length=500)
+class ChildPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=60)
     active: bool | None = None
 
 
-class PickupIn(BaseModel):
-    picked_up_on: date
-    picked_up_by: str = Field(default="", max_length=60)
+class PrescriptionIn(BaseModel):
+    child_id: int
+    name: str = Field(min_length=1, max_length=120)
+    pharmacy: str = Field(default="", max_length=120)
+    contact_name: str = Field(default="", max_length=120)
+    contact_phone: str = Field(default="", max_length=40)
+    days_supply: int = Field(default=30, ge=1, le=365)
+    refill_after_days: int = Field(default=28, ge=1, le=365)
+    notes: str = Field(default="", max_length=500)
+    assignee_id: int | None = None
+
+
+class PrescriptionPatch(BaseModel):
+    child_id: int | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    pharmacy: str | None = Field(default=None, max_length=120)
+    contact_name: str | None = Field(default=None, max_length=120)
+    contact_phone: str | None = Field(default=None, max_length=40)
+    days_supply: int | None = Field(default=None, ge=1, le=365)
+    refill_after_days: int | None = Field(default=None, ge=1, le=365)
+    notes: str | None = Field(default=None, max_length=500)
+    assignee_id: int | None = None
+    active: bool | None = None
+
+
+class RefillPickupIn(BaseModel):
+    picked_up_on: date = Field(default_factory=date.today)
+    notes: str = Field(default="", max_length=500)
+    override: bool = False
+
+
+class CalledIn(BaseModel):
+    notes: str = Field(default="", max_length=500)
 
 
 class UpkeepItemIn(BaseModel):
@@ -260,6 +284,7 @@ class UpkeepLogIn(BaseModel):
 
 class ReminderSettingsIn(BaseModel):
     reminder_email: str = Field(max_length=200)
+    refill_detail_in_notifications: bool | None = None
 
 
 # Every /api route declares exactly one of these (enforced by tests/test_api_auth.py).
@@ -398,7 +423,7 @@ button{{padding:.6rem 1rem;border-radius:.5rem;border:0;font-size:1rem;cursor:po
 .ok{{background:#0f766e;color:#fff}}.no{{background:#e7e5e4;color:#292524;margin-left:.5rem}}.err{{color:#b91c1c}}</style></head>
 <body><main><h1>Let <b>{escape(req["client_name"])}</b> use Home?</h1>
 <p>It will be able to read and change rooms, tasks, upkeep, pantry and the shopping list as the <b>connector</b> role.
-It will <b>not</b> see medications or admin settings. You can revoke it any time from Manage.</p>
+It will <b>not</b> see people's passwords or admin settings. You can revoke it any time from Manage.</p>
 {err}<form method="post"><input type="hidden" name="req" value="{escape(pending_id)}">
 <label>Admin password<input type="password" name="password" autofocus required></label>
 <button class="ok" name="decision" value="approve">Allow</button><button class="no" name="decision" value="deny">Cancel</button></form>
@@ -1160,115 +1185,178 @@ def delete_pantry_item(item_id: int):
         conn.execute("DELETE FROM pantry_items WHERE id = ?", (item_id,))
 
 
-# ---------- Medications ----------
+# ---------- Prescription refills (children, prescriptions, pickups) ----------
+# Reads, pickups and "called" are for every named user; adding/editing a prescription is admin (or Claude).
 
 
-def serialize_medication(conn: sqlite3.Connection, m: sqlite3.Row) -> dict:
-    last = conn.execute(
-        "SELECT * FROM med_pickups WHERE medication_id = ? ORDER BY picked_up_on DESC, id DESC LIMIT 1",
-        (m["id"],),
-    ).fetchone()
-    reorder_on = None
-    days_left = None
-    status = "none"
-    if last:
-        reorder_date = date.fromisoformat(last["picked_up_on"]) + timedelta(days=m["reorder_days"])
-        reorder_on = reorder_date.isoformat()
-        days_left = (reorder_date - date.today()).days
-        status = "due" if days_left <= 0 else "soon" if days_left <= 5 else "ok"
-    return {
-        "id": m["id"],
-        "name": m["name"],
-        "person": m["person"],
-        "reorder_days": m["reorder_days"],
-        "notes": m["notes"],
-        "active": bool(m["active"]),
-        "last_picked_up_on": last["picked_up_on"] if last else None,
-        "last_picked_up_by": last["picked_up_by"] if last else None,
-        "last_pickup_id": last["id"] if last else None,
-        "reminder_sent_at": last["reminder_sent_at"] if last else None,
-        "reorder_on": reorder_on,
-        "days_left": days_left,
-        "status": status,
-    }
+def fetch_child_or_404(conn: sqlite3.Connection, child_id: int) -> sqlite3.Row:
+    c = conn.execute("SELECT * FROM children WHERE id = ?", (child_id,)).fetchone()
+    if not c:
+        raise HTTPException(404, "Child not found")
+    return c
 
 
-def fetch_med_or_404(conn: sqlite3.Connection, med_id: int) -> sqlite3.Row:
-    m = conn.execute("SELECT * FROM medications WHERE id = ?", (med_id,)).fetchone()
-    if not m:
-        raise HTTPException(404, "Medication not found")
-    return m
+def fetch_prescription_or_404(conn: sqlite3.Connection, rx_id: int) -> sqlite3.Row:
+    p = conn.execute("SELECT * FROM prescriptions WHERE id = ?", (rx_id,)).fetchone()
+    if not p:
+        raise HTTPException(404, "Prescription not found")
+    return p
 
 
-@app.get("/api/medications", dependencies=ADMIN)
-def list_medications(include_inactive: bool = False):
+def serialize_child(c: sqlite3.Row) -> dict:
+    return {"id": c["id"], "name": c["name"], "active": bool(c["active"])}
+
+
+@app.get("/api/children", dependencies=MEMBER)
+def list_children(include_inactive: bool = False):
     with get_conn() as conn:
         where = "" if include_inactive else "WHERE active = 1"
-        rows = conn.execute(f"SELECT * FROM medications {where} ORDER BY person, name").fetchall()
-        return [serialize_medication(conn, m) for m in rows]
+        return [serialize_child(c) for c in conn.execute(f"SELECT * FROM children {where} ORDER BY name")]
 
 
-@app.post("/api/medications", status_code=201, dependencies=ADMIN)
-def create_medication(body: MedicationIn):
+@app.post("/api/children", status_code=201, dependencies=ADMIN)
+def create_child(body: ChildIn):
     with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO medications (name, person, reorder_days, notes) VALUES (?, ?, ?, ?)",
-            (body.name.strip(), body.person.strip(), body.reorder_days, body.notes.strip()),
-        )
-        return serialize_medication(conn, fetch_med_or_404(conn, cur.lastrowid))
+        dup = conn.execute("SELECT * FROM children WHERE lower(name) = lower(?)", (body.name.strip(),)).fetchone()
+        if dup:
+            return serialize_child(dup)
+        cur = conn.execute("INSERT INTO children (name) VALUES (?)", (body.name.strip(),))
+        return serialize_child(fetch_child_or_404(conn, cur.lastrowid))
 
 
-@app.patch("/api/medications/{med_id}", dependencies=ADMIN)
-def update_medication(med_id: int, body: MedicationPatch):
+@app.patch("/api/children/{child_id}", dependencies=ADMIN)
+def update_child(child_id: int, body: ChildPatch):
     with get_conn() as conn:
-        fetch_med_or_404(conn, med_id)
+        fetch_child_or_404(conn, child_id)
         fields = body.model_dump(exclude_unset=True)
+        if "name" in fields:
+            fields["name"] = fields["name"].strip()
         if "active" in fields:
             fields["active"] = int(fields["active"])
-        for k in ("name", "person", "notes"):
+        if fields:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            conn.execute(f"UPDATE children SET {sets} WHERE id = ?", (*fields.values(), child_id))
+        return serialize_child(fetch_child_or_404(conn, child_id))
+
+
+@app.get("/api/prescriptions", dependencies=MEMBER)
+def list_prescriptions(child_id: int | None = None, include_inactive: bool = False):
+    with get_conn() as conn:
+        where, params = [], []
+        if not include_inactive:
+            where.append("p.active = 1 AND c.active = 1")
+        if child_id is not None:
+            where.append("p.child_id = ?")
+            params.append(child_id)
+        sql = "SELECT p.* FROM prescriptions p JOIN children c ON c.id = p.child_id"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY c.name, p.name"
+        return [refills.serialize_prescription(conn, p) for p in conn.execute(sql, params)]
+
+
+@app.get("/api/refills", dependencies=MEMBER)
+def list_due_refills():
+    """Prescriptions that are refill_due or urgent. An item stays here until a pickup is logged."""
+    with get_conn() as conn:
+        return refills.due_refills(conn)
+
+
+@app.post("/api/prescriptions", status_code=201, dependencies=ADMIN)
+def create_prescription(body: PrescriptionIn):
+    with get_conn() as conn:
+        fetch_child_or_404(conn, body.child_id)
+        if body.assignee_id is not None:
+            fetch_user_or_404(conn, body.assignee_id)
+        cur = conn.execute(
+            "INSERT INTO prescriptions (child_id, name, pharmacy, contact_name, contact_phone, days_supply, "
+            "refill_after_days, notes, assignee_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                body.child_id,
+                body.name.strip(),
+                body.pharmacy.strip(),
+                body.contact_name.strip(),
+                body.contact_phone.strip(),
+                body.days_supply,
+                body.refill_after_days,
+                body.notes.strip(),
+                body.assignee_id,
+            ),
+        )
+        return refills.serialize_prescription(conn, fetch_prescription_or_404(conn, cur.lastrowid))
+
+
+@app.patch("/api/prescriptions/{rx_id}", dependencies=ADMIN)
+def update_prescription(rx_id: int, body: PrescriptionPatch):
+    with get_conn() as conn:
+        fetch_prescription_or_404(conn, rx_id)
+        fields = body.model_dump(exclude_unset=True)
+        if "child_id" in fields:
+            fetch_child_or_404(conn, fields["child_id"])
+        if fields.get("assignee_id") is not None:
+            fetch_user_or_404(conn, fields["assignee_id"])
+        if "active" in fields:
+            fields["active"] = int(fields["active"])
+        for k in ("name", "pharmacy", "contact_name", "contact_phone", "notes"):
             if k in fields and fields[k] is not None:
                 fields[k] = fields[k].strip()
         if fields:
             sets = ", ".join(f"{k} = ?" for k in fields)
-            conn.execute(f"UPDATE medications SET {sets} WHERE id = ?", (*fields.values(), med_id))
-        return serialize_medication(conn, fetch_med_or_404(conn, med_id))
+            conn.execute(f"UPDATE prescriptions SET {sets} WHERE id = ?", (*fields.values(), rx_id))
+        return refills.serialize_prescription(conn, fetch_prescription_or_404(conn, rx_id))
 
 
-@app.delete("/api/medications/{med_id}", status_code=204, dependencies=ADMIN)
-def delete_medication(med_id: int):
+@app.post("/api/prescriptions/{rx_id}/pickups", status_code=201, dependencies=MEMBER)
+def log_pickup(rx_id: int, body: RefillPickupIn, actor: Actor = ACTOR):
+    """A pickup restarts the clock and clears "called". A second pickup on the same day is refused
+    unless `override` is set, since it's almost always a double entry."""
     with get_conn() as conn:
-        fetch_med_or_404(conn, med_id)
-        conn.execute("DELETE FROM medications WHERE id = ?", (med_id,))
-
-
-@app.post("/api/medications/{med_id}/pickups", status_code=201, dependencies=ADMIN)
-def log_pickup(med_id: int, body: PickupIn):
-    with get_conn() as conn:
-        fetch_med_or_404(conn, med_id)
+        fetch_prescription_or_404(conn, rx_id)
+        day = body.picked_up_on.isoformat()
+        same_day = conn.execute(
+            "SELECT 1 FROM pickups WHERE prescription_id = ? AND picked_up_on = ?", (rx_id, day)
+        ).fetchone()
+        if same_day and not body.override:
+            raise HTTPException(
+                409, f"A pickup for this prescription is already logged on {day}. Send override=true if it really happened twice."
+            )
         conn.execute(
-            "INSERT INTO med_pickups (medication_id, picked_up_on, picked_up_by) VALUES (?, ?, ?)",
-            (med_id, body.picked_up_on.isoformat(), body.picked_up_by.strip()),
+            "INSERT INTO pickups (prescription_id, picked_up_on, picked_up_by, user_id, notes) VALUES (?, ?, ?, ?, ?)",
+            (rx_id, day, actor.attribution(), actor.user_id, body.notes.strip()),
         )
-        return serialize_medication(conn, fetch_med_or_404(conn, med_id))
+        conn.execute("UPDATE prescriptions SET called_on = NULL, called_by = '', called_notes = '' WHERE id = ?", (rx_id,))
+        return refills.serialize_prescription(conn, fetch_prescription_or_404(conn, rx_id))
 
 
-@app.get("/api/medications/{med_id}/pickups", dependencies=ADMIN)
-def pickup_history(med_id: int, limit: int = 50):
+@app.get("/api/prescriptions/{rx_id}/pickups", dependencies=MEMBER)
+def pickup_history(rx_id: int, limit: int = 50):
     with get_conn() as conn:
-        fetch_med_or_404(conn, med_id)
+        fetch_prescription_or_404(conn, rx_id)
         rows = conn.execute(
-            "SELECT * FROM med_pickups WHERE medication_id = ? ORDER BY picked_up_on DESC, id DESC LIMIT ?",
-            (med_id, limit),
+            "SELECT * FROM pickups WHERE prescription_id = ? ORDER BY picked_up_on DESC, id DESC LIMIT ?", (rx_id, limit)
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-@app.delete("/api/pickups/{pickup_id}", status_code=204, dependencies=ADMIN)
+@app.delete("/api/pickups/{pickup_id}", status_code=204, dependencies=MEMBER)
 def delete_pickup(pickup_id: int):
     with get_conn() as conn:
-        if not conn.execute("SELECT 1 FROM med_pickups WHERE id = ?", (pickup_id,)).fetchone():
+        if not conn.execute("SELECT 1 FROM pickups WHERE id = ?", (pickup_id,)).fetchone():
             raise HTTPException(404, "Pickup not found")
-        conn.execute("DELETE FROM med_pickups WHERE id = ?", (pickup_id,))
+        conn.execute("DELETE FROM pickups WHERE id = ?", (pickup_id,))
+
+
+@app.post("/api/prescriptions/{rx_id}/called", dependencies=MEMBER)
+def mark_called(rx_id: int, body: CalledIn, actor: Actor = ACTOR):
+    """"I called the pharmacy / the doctor's office." Quiets refill_due for two days, then it comes
+    back if nothing was picked up. Never quiets urgent."""
+    with get_conn() as conn:
+        fetch_prescription_or_404(conn, rx_id)
+        conn.execute(
+            "UPDATE prescriptions SET called_on = ?, called_by = ?, called_notes = ? WHERE id = ?",
+            (date.today().isoformat(), actor.attribution(), body.notes.strip(), rx_id),
+        )
+        return refills.serialize_prescription(conn, fetch_prescription_or_404(conn, rx_id))
 
 
 # ---------- Home upkeep (house-wide recurring maintenance) ----------
@@ -1395,10 +1483,16 @@ def delete_upkeep_log(log_id: int):
 
 @app.get("/api/admin/reminders", dependencies=ADMIN)
 def get_reminder_settings():
+    with get_conn() as conn:
+        return _reminder_settings(conn)
+
+
+def _reminder_settings(conn: sqlite3.Connection) -> dict:
     return {
         "reminder_email": notify.get_reminder_email(),
         "email_configured": notify.email_configured(),
-        "due": notify.due_pickups(),
+        "refill_detail_in_notifications": refills.detail_enabled(conn),
+        "due_refills": refills.due_refills(conn),
         "due_upkeep": notify.due_upkeep(),
         "pending_assignments": notify.pending_assignment_notifications(),
     }
@@ -1411,7 +1505,9 @@ def set_reminder_settings(body: ReminderSettingsIn):
             "INSERT INTO settings (key, value) VALUES ('reminder_email', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (body.reminder_email.strip(),),
         )
-    return get_reminder_settings()
+        if body.refill_detail_in_notifications is not None:
+            refills.set_detail_enabled(conn, body.refill_detail_in_notifications)
+        return _reminder_settings(conn)
 
 
 @app.post("/api/admin/reminders/test", dependencies=ADMIN)
@@ -1429,7 +1525,8 @@ def send_test_reminder():
 
 
 # ---------- Status summary ----------
-# Household-readable. Must never include medication/pickup data (see tests).
+# Readable by every member. The only medication data allowed here is the refills digest
+# (child, prescription, days of supply left for anything refill_due/urgent) - see tests.
 
 
 def task_days_until_due(t: dict) -> int | None:
@@ -1478,6 +1575,7 @@ def status_summary():
             for i in conn.execute("SELECT * FROM upkeep_items WHERE active = 1 ORDER BY name").fetchall()
         ]
         pantry = [serialize_pantry(r) for r in conn.execute("SELECT * FROM pantry_items ORDER BY name").fetchall()]
+        due = refills.status_section(conn)
     return {
         "generated_on": date.today().isoformat(),
         "tasks_overdue": overdue,
@@ -1488,6 +1586,7 @@ def status_summary():
         "pantry_expiring_within_7_days": [
             p for p in pantry if p["days_to_expiry"] is not None and p["days_to_expiry"] <= 7
         ],
+        "refills": due,
     }
 
 

@@ -218,7 +218,7 @@ function ConnectorCard() {
       </h2>
       <p className="mb-2 text-sm text-stone-500">
         Add this URL as a custom connector in Claude; it will ask for your admin password once. Claude gets its own
-        "connector" role: rooms, tasks, upkeep, pantry and shopping, never medications or settings.
+        "connector" role: rooms, tasks, upkeep, pantry, shopping and refills, never settings.
       </p>
       <div className="mb-2 flex items-center gap-2">
         <code className="flex-1 truncate rounded-lg bg-stone-100 px-2 py-1.5 text-xs">{status.mcp_url}</code>
@@ -272,6 +272,15 @@ function ReminderSettingsCard() {
     }
   }
 
+  async function toggleDetail(on: boolean) {
+    setMsg(null)
+    try {
+      setSettings(await api.saveReminderSettings(email, on))
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message })
+    }
+  }
+
   async function sendTest() {
     setMsg(null)
     try {
@@ -288,10 +297,10 @@ function ReminderSettingsCard() {
   return (
     <section className="rounded-xl bg-white p-4 shadow-sm">
       <h2 className="mb-1 flex items-center gap-2 font-medium">
-        <Mail className="size-5 text-teal-700" /> Medication reorder reminders
+        <Mail className="size-5 text-teal-700" /> Refill &amp; upkeep reminders
       </h2>
       <p className="mb-2 text-sm text-stone-500">
-        When a prescription hits its reorder date, an email goes to this address (checked hourly).
+        Refill reminders go to Courtney (and whoever a prescription is assigned to) in the app every day an item is due. Upkeep reminders email this address when configured.
       </p>
       {!settings.email_configured && (
         <p className="mb-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800">
@@ -327,9 +336,23 @@ function ReminderSettingsCard() {
           {msg.text}
         </p>
       )}
-      {settings.due.length > 0 && (
+      <label className="mt-3 flex items-start gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={settings.refill_detail_in_notifications}
+          onChange={(e) => toggleDetail(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Include the prescription name in refill notifications
+          <span className="block text-xs text-stone-500">
+            Off by default: notifications say "Refill due for &lt;child&gt;, open the app" so a lock screen never shows what a child takes.
+          </span>
+        </span>
+      </label>
+      {settings.due_refills.length > 0 && (
         <p className="mt-2 text-xs text-stone-500">
-          Meds due now: {settings.due.map((d) => `${d.name} (${d.person}, ${formatDay(d.reorder_on)})`).join(', ')}
+          Refills due now: {settings.due_refills.map((d) => `${d.child} · ${d.name} (${d.refill_status === 'urgent' ? 'URGENT' : `${d.days_of_supply_left}d left`})`).join(', ')}
         </p>
       )}
       {settings.due_upkeep.length > 0 && (
@@ -412,7 +435,7 @@ function UsersCard({ me, users, onChange }: { me: User | null; users: User[]; on
       <h2 className="mb-1 flex items-center gap-2 font-medium">
         <Users className="size-5 text-teal-700" /> People
       </h2>
-      <p className="mb-2 text-sm text-stone-500">Everyone logs in with their own name and password; admins can also manage rooms, people and medications.</p>
+      <p className="mb-2 text-sm text-stone-500">Everyone logs in with their own name and password; admins can also manage rooms, people and prescriptions.</p>
       <ul className="mb-3 divide-y divide-stone-100">
         {users.map((u) => (
           <li key={u.id} className="flex flex-wrap items-center gap-2 py-2 text-sm">

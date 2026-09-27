@@ -1,4 +1,4 @@
-"""Reminder emails for medication reorders and recurring home upkeep.
+"""Reminders: prescription refills (in-app, emailed when configured) and recurring home upkeep emails.
 
 Delivery is configured by environment variables; whichever is present is used:
   RESEND_API_KEY                         -> https://resend.com API
@@ -17,6 +17,7 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 
+from . import refills
 from .db import get_conn
 
 log = logging.getLogger("notify")
@@ -71,29 +72,6 @@ def get_reminder_email() -> str:
     return row["value"] if row else os.environ.get("REMINDER_EMAIL", "")
 
 
-def due_pickups() -> list[dict]:
-    """Latest pickup per active medication whose reorder date has arrived and hasn't been emailed."""
-    today = date.today()
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT p.id AS pickup_id, p.picked_up_on, p.reminder_sent_at,
-                   m.id AS medication_id, m.name, m.person, m.reorder_days
-            FROM medications m
-            JOIN med_pickups p ON p.id = (
-                SELECT id FROM med_pickups WHERE medication_id = m.id ORDER BY picked_up_on DESC, id DESC LIMIT 1
-            )
-            WHERE m.active = 1 AND p.reminder_sent_at IS NULL
-            """
-        ).fetchall()
-    out = []
-    for r in rows:
-        reorder_on = date.fromisoformat(r["picked_up_on"]) + timedelta(days=r["reorder_days"])
-        if reorder_on <= today:
-            out.append({**dict(r), "reorder_on": reorder_on.isoformat()})
-    return out
-
-
 def due_upkeep() -> list[dict]:
     """Latest log per active upkeep item whose next-due date has arrived and hasn't been emailed.
 
@@ -122,7 +100,7 @@ def due_upkeep() -> list[dict]:
 
 
 def pending_assignment_notifications() -> list[dict]:
-    """Assignment notifications not yet emailed, with the person's name and email (may be blank)."""
+    """Notifications (assignments and refill reminders) not yet emailed, with the person's email (may be blank)."""
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -156,25 +134,19 @@ def send_assignment_notifications() -> int:
 
 
 def send_due_reminders() -> int:
+    """Refill reminders are created as in-app notifications every day an item is due (even with no
+    email configured); everything below that is email."""
+    refills.create_due_notifications()
     if not email_configured():
         return 0
     sent_assignments = send_assignment_notifications()
     to = get_reminder_email()
     if not to:
         return sent_assignments
-    meds = due_pickups()
     upkeep = due_upkeep()
-    if not meds and not upkeep:
+    if not upkeep:
         return sent_assignments
     sections = []
-    if meds:
-        sections.append(
-            "Time to reorder these prescriptions:\n"
-            + "\n".join(
-                f"- {d['name']} for {d['person']} (picked up {d['picked_up_on']}, reorder was due {d['reorder_on']})"
-                for d in meds
-            )
-        )
     if upkeep:
         sections.append(
             "Home upkeep that's due:\n"
@@ -184,15 +156,11 @@ def send_due_reminders() -> int:
             )
         )
     body = "\n\n".join(sections) + "\n\nOpen the app and mark each one done once it's taken care of."
-    names = [d["name"] for d in meds] + [d["name"] for d in upkeep]
+    names = [d["name"] for d in upkeep]
     subject = f"Home reminder: {', '.join(names[:3])}" + (f" +{len(names) - 3} more" if len(names) > 3 else "")
     send_email(to, subject, body)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_conn() as conn:
-        conn.executemany(
-            "UPDATE med_pickups SET reminder_sent_at = ? WHERE id = ?",
-            [(now, d["pickup_id"]) for d in meds],
-        )
         conn.executemany(
             "UPDATE upkeep_logs SET reminder_sent_at = ? WHERE id = ?",
             [(now, d["log_id"]) for d in upkeep],
