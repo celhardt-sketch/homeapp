@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
-import { Check, ShoppingCart, Trash2 } from 'lucide-react'
+import { Check, Plus, ShoppingCart, Trash2 } from 'lucide-react'
 import { api, formatDay, formatFrequency, type ListItem, type PersonList, type User } from '../api'
 
 export default function MyListPage({ me }: { me: User }) {
@@ -10,6 +10,12 @@ export default function MyListPage({ me }: { me: User }) {
   const [includeDone, setIncludeDone] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const mine = person.id === me.id
+  const canAdd = mine || me.role === 'admin'
+  const [title, setTitle] = useState('')
+  const [kind, setKind] = useState<'task' | 'shopping'>('task')
+  const [dueOn, setDueOn] = useState('')
+  const [notes, setNotes] = useState('')
+  const [saving, setSaving] = useState(false)
 
   const load = useCallback(() => {
     setError(null)
@@ -44,6 +50,27 @@ export default function MyListPage({ me }: { me: User }) {
     }
   }
 
+  async function add(e: FormEvent) {
+    e.preventDefault()
+    const t = title.trim()
+    if (!t) return
+    setError(null)
+    setSaving(true)
+    try {
+      const body = { assignee_id: person.id, due_on: dueOn || null }
+      if (kind === 'task') await api.createTask({ ...body, title: t, description: notes.trim(), frequency_days: null })
+      else await api.createShoppingItem({ ...body, name: t, notes: notes.trim() })
+      setTitle('')
+      setDueOn('')
+      setNotes('')
+      load()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div>
@@ -65,6 +92,48 @@ export default function MyListPage({ me }: { me: User }) {
             </button>
           ))}
         </div>
+      )}
+
+      {canAdd && (
+        <form onSubmit={add} className="space-y-2 rounded-xl bg-white p-3 shadow-sm">
+          <div className="flex gap-2">
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder={kind === 'task' ? (mine ? 'Add to my list, e.g. preschool form due' : `Add to ${person.name}'s list`) : 'Something to buy'}
+              className="flex-1 rounded-lg border border-stone-300 px-3 py-2"
+              aria-label="New item"
+            />
+            <button
+              type="submit"
+              disabled={saving || !title.trim()}
+              className="flex items-center gap-1 rounded-lg bg-teal-700 px-3 py-2 text-white disabled:opacity-50"
+            >
+              <Plus className="size-4" /> Add
+            </button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <div className="flex rounded-full bg-stone-100 p-0.5">
+              {(['task', 'shopping'] as const).map((k) => (
+                <button
+                  key={k}
+                  type="button"
+                  onClick={() => setKind(k)}
+                  className={`rounded-full px-3 py-1 ${kind === k ? 'bg-white shadow-sm' : 'text-stone-500'}`}
+                >
+                  {k === 'task' ? 'To do' : 'To buy'}
+                </button>
+              ))}
+            </div>
+            <input type="date" value={dueOn} onChange={(e) => setDueOn(e.target.value)} className="rounded-lg border border-stone-300 px-2 py-1" aria-label="Due date" />
+            <input
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Notes (optional)"
+              className="min-w-0 flex-1 rounded-lg border border-stone-300 px-2 py-1"
+            />
+          </div>
+        </form>
       )}
 
       {error && <p className="rounded-lg bg-red-50 p-2 text-sm text-red-700">{error}</p>}
