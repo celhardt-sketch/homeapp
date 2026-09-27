@@ -12,14 +12,15 @@ const STATUS_STYLE: Record<UpkeepItem['status'], string> = {
 const INTERVALS = [7, 14, 30, 60, 90, 180, 365, 730]
 
 function statusLabel(i: UpkeepItem): string {
-  if (i.status === 'none' || i.days_left === null) return 'Not logged yet'
+  if (i.days_left === null) return 'Not logged yet'
+  if (i.last_done_on === null) return 'Never logged — due now'
   if (i.days_left < 0) return `Overdue by ${-i.days_left} day${i.days_left === -1 ? '' : 's'}`
   if (i.days_left === 0) return 'Due today'
   return `Due in ${i.days_left} day${i.days_left === 1 ? '' : 's'}`
 }
 
 function sortKey(i: UpkeepItem): number {
-  return i.days_left ?? (i.status === 'none' ? -0.5 : 9999)
+  return i.days_left ?? 9999
 }
 
 export default function UpkeepPage({ userName }: { userName: string }) {

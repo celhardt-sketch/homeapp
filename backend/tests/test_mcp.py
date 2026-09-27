@@ -223,6 +223,29 @@ def test_log_upkeep_done_180_days(mcp, client, household_headers):
     assert item["status"] == "ok"
 
 
+def test_never_logged_upkeep_is_due(mcp, client, household_headers):
+    r = client.post(
+        "/api/upkeep",
+        json={"name": "Change furnace filter zz", "category": "HVAC", "interval_days": 90},
+        headers=household_headers,
+    )
+    assert r.status_code == 201
+    item = r.json()
+    try:
+        assert item["last_done_on"] is None
+        assert item["status"] == "due"
+        assert item["due_on"] == date.today().isoformat()
+        assert item["days_left"] == 0
+
+        due = _unwrap(mcp("list_upkeep", due_only=True))
+        assert item["id"] in [i["id"] for i in due]
+
+        status = client.get("/api/status", headers=household_headers).json()
+        assert item["id"] in [i["id"] for i in status["upkeep_due"]]
+    finally:
+        client.delete(f"/api/upkeep/{item['id']}", headers=household_headers)
+
+
 def test_quantity_delta_and_find(mcp):
     added = mcp("add_pantry_items", items=[{"name": "Large eggs", "quantity": "12", "location": "Fridge"}])
     assert len(added["added"]) == 1

@@ -97,7 +97,8 @@ def due_pickups() -> list[dict]:
 def due_upkeep() -> list[dict]:
     """Latest log per active upkeep item whose next-due date has arrived and hasn't been emailed.
 
-    Items that have never been logged have no schedule yet and are only flagged in-app.
+    Items that have never been logged are due in-app (and via MCP/status) but have no log
+    row to record an email against, so they are not emailed.
     """
     today = date.today()
     with get_conn() as conn:
