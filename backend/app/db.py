@@ -128,6 +128,33 @@ CREATE TABLE IF NOT EXISTS pickups (
 );
 CREATE INDEX IF NOT EXISTS idx_pickups ON pickups(prescription_id, picked_up_on DESC);
 
+CREATE TABLE IF NOT EXISTS child_sizes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    child_id INTEGER NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    value TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT '',
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    UNIQUE(child_id, category)
+);
+
+CREATE TABLE IF NOT EXISTS child_needs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    child_id INTEGER NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    season TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'needed',
+    shopping_item_id INTEGER REFERENCES shopping_items(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    resolved_at TEXT,
+    resolved_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_child_needs ON child_needs(child_id, status);
+
 CREATE TABLE IF NOT EXISTS upkeep_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,

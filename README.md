@@ -43,7 +43,7 @@ Accounts are created on first start from `HOME_USERS` (default `Courtney:admin,M
 
 ## Claude connector (MCP)
 
-The server exposes a remote MCP server (Streamable HTTP) at `/mcp` so Claude can read and write rooms, tasks, upkeep, pantry, the shopping list and prescription refills. It runs in the same process and database as the app.
+The server exposes a remote MCP server (Streamable HTTP) at `/mcp` so Claude can read and write rooms, tasks, people's lists, upkeep, pantry, the shopping list, the kids' sizes and needs, and prescription refills (32 tools; the full list is `EXPECTED_TOOLS` in `backend/tests/test_mcp.py`). It runs in the same process and database as the app.
 
 - **Connect:** in Claude, add a custom connector with the URL shown on the Manage page (`https://<your-domain>/mcp`). Claude registers itself (OAuth 2.1 dynamic client registration + PKCE) and opens an approval page that asks for the **admin** password once. No static API keys.
 - **Role:** Claude acts as a third role, `connector` — same data as a member plus room management and the refill tools, but it can never reach `/api/admin/*`.

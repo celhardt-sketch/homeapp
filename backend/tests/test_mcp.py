@@ -19,13 +19,26 @@ from app import oauth
 from app.main import app
 from tests.conftest import oauth_connect
 
-TOOLS = {
+# THE list of tools this app exposes to Claude. A feature is not done until its tools are here AND
+# appear in tools/list; test_handshake_lists_all_tools compares the live server against this exactly,
+# so a tool shipped without being registered (or registered without being listed here) fails the suite.
+EXPECTED_TOOLS = [
+    # original 14
     "get_home_status", "list_rooms", "list_tasks", "add_task", "complete_task", "list_upkeep",
     "log_upkeep_done", "list_pantry", "add_pantry_items", "update_pantry_item", "remove_pantry_item",
     "list_shopping", "add_to_shopping", "find",
-    "add_to_list", "list_for_person", "add_room", "rename_room", "archive_room",
+    # rooms
+    "add_room", "rename_room", "archive_room",
+    # lists and assignment
+    "add_to_list", "list_for_person",
+    # children: sizes and needs
+    "list_children", "get_child", "set_size", "list_sizes", "add_need", "mark_have", "list_needs",
+    "seasonal_check",
+    # prescriptions and refills
     "list_refills", "log_pickup", "mark_called", "list_prescriptions", "add_prescription",
-}
+]
+assert len(EXPECTED_TOOLS) == 32 == len(set(EXPECTED_TOOLS))
+TOOLS = set(EXPECTED_TOOLS)
 
 
 @pytest.fixture(scope="module")
@@ -79,8 +92,19 @@ def test_handshake_lists_all_tools(server_url, client):
             return {t.name: t.description for t in await c.list_tools()}
 
     tools = asyncio.run(go())
-    assert set(tools) == TOOLS
+    missing, extra = TOOLS - set(tools), set(tools) - TOOLS
+    assert not missing, f"tools/list is missing: {sorted(missing)}"
+    assert not extra, f"tools/list has tools not in EXPECTED_TOOLS (add them there): {sorted(extra)}"
+    assert len(tools) == 32
     assert all(tools[n] for n in TOOLS), "every tool needs a spoken-language description"
+
+    # list_tasks takes an assignee filter and add_task an assignee argument
+    async def schemas():
+        async with Client(StreamableHttpTransport(f"{server_url}/mcp", headers={"Authorization": f"Bearer {token}"})) as c:
+            return {t.name: t.inputSchema["properties"] for t in await c.list_tools()}
+
+    props = asyncio.run(schemas())
+    assert "assignee" in props["list_tasks"] and "assignee" in props["add_task"]
 
 
 def test_mcp_requires_oauth_token(server_url):
