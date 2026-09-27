@@ -11,7 +11,8 @@ Web app for tracking recurring maintenance tasks per room, opened by scanning an
 - **Manage** page: add/edit rooms and tasks, copy each room's NFC link; admin also deletes rooms, sets both passwords and reminder settings.
 
 - **Upkeep** page: house-wide recurring jobs not tied to a room (HVAC filter, car oil change, window screens, gutters…). Each has a repeat interval; "Mark done" logs who/when and schedules the next reminder, shown in-app (Home page banner + Upkeep tab) and emailed.
-- **Pantry** page: track what's stocked; mark items "low" and they appear on To Buy.
+- **Pantry** page: track what's stocked; mark items "low" and they appear on To Buy. An optional **par level** makes an item low automatically when its quantity (leading number, e.g. `2 bags`) is at or below it; an optional expiry date flags items expiring within a week. "Add many" adds a whole grocery run in one request. Adding a name that closely matches an existing item (case-insensitive, substring, or a typo) returns the existing item flagged `duplicate` instead of creating a second row.
+- `GET /api/status` (household-readable) summarises tasks overdue / due today / due within 7 days, upkeep due, pantry below par and pantry expiring within 7 days. It never includes medication data (enforced by a test).
 - **Meds** page: log each prescription pickup (date + who for). A reorder reminder is due 28 days later (adjustable), shown in-app and emailed.
 
 ## Reminder emails
@@ -31,7 +32,7 @@ Without either, reminders are still shown in the app.
 | Delete rooms, activity feed, medications, pickups, `/api/admin/*`, passwords | — (403) | yes |
 | Session | 365 days, sliding (renewed on every request) | 30 days |
 
-On first start the server sets the passwords from `ADMIN_PASSWORD` (default `admin`) and `HOUSEHOLD_PASSWORD` (default `home`). Change them from the Manage page (key icon, admin only) — they then live in the database and the env vars are ignored. Until you do, the env var wins on every start — so setting `HOUSEHOLD_PASSWORD` after the first deploy still takes effect on the next restart. Changing a password logs out every device using that role.
+There are no default passwords. On first start the server sets the passwords from `ADMIN_PASSWORD` and `HOUSEHOLD_PASSWORD`; if either is missing (and no password is stored yet for that role) the server refuses to start and logs which variable is missing. Change them from the Manage page (key icon, admin only) — they then live in the database and the env vars are ignored. A stored password still equal to an old built-in default (`admin` / `home`) is treated as unset. Changing a password logs out every device using that role.
 
 ## Stack
 
@@ -56,4 +57,4 @@ npm run dev
 
 ## Deploy (Railway or any Docker host)
 
-The `Dockerfile` builds the frontend and serves it from FastAPI. Mount a persistent volume at `/data` (or set `DATA_DIR`) so the SQLite database survives redeploys. Set `ADMIN_PASSWORD` and `HOUSEHOLD_PASSWORD` before the first start to pick the initial passwords. The server listens on `$PORT` (default 8000).
+The `Dockerfile` builds the frontend and serves it from FastAPI. Mount a persistent volume at `/data` (or set `DATA_DIR`) so the SQLite database survives redeploys. `ADMIN_PASSWORD` and `HOUSEHOLD_PASSWORD` are required for the first start (the app will not boot without them). The server listens on `$PORT` (default 8000).

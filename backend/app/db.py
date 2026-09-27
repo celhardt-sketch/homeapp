@@ -102,6 +102,11 @@ def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        pantry_cols = {r["name"] for r in conn.execute("PRAGMA table_info(pantry_items)")}
+        if "par_level" not in pantry_cols:
+            conn.execute("ALTER TABLE pantry_items ADD COLUMN par_level REAL")
+        if "expires_on" not in pantry_cols:
+            conn.execute("ALTER TABLE pantry_items ADD COLUMN expires_on TEXT")
 
 
 @contextmanager

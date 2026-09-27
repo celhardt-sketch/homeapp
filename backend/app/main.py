@@ -1,6 +1,8 @@
 import asyncio
+import logging
 import re
 import sqlite3
+from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -9,19 +11,25 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from typing import Union
 
 from . import auth, notify
 from .db import get_conn, init_db
 from .seed import seed_if_empty
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+log = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
     seed_if_empty()
-    auth.ensure_admin_credentials()
+    try:
+        auth.ensure_admin_credentials()
+    except auth.MissingPasswordError as exc:
+        log.critical("%s", exc)
+        raise
     reminder_task = asyncio.create_task(notify.reminder_loop())
     yield
     reminder_task.cancel()
@@ -126,6 +134,8 @@ class PantryItemIn(BaseModel):
     category: str = Field(default="", max_length=60)
     quantity: str = Field(default="", max_length=60)
     low: bool = False
+    par_level: float | None = Field(default=None, ge=0)
+    expires_on: date | None = None
     updated_by: str = Field(default="", max_length=60)
 
 
@@ -134,6 +144,8 @@ class PantryItemPatch(BaseModel):
     category: str | None = Field(default=None, max_length=60)
     quantity: str | None = Field(default=None, max_length=60)
     low: bool | None = None
+    par_level: float | None = Field(default=None, ge=0)
+    expires_on: date | None = None
     updated_by: str = Field(default="", max_length=60)
 
 
@@ -502,8 +514,65 @@ def recent_activity(limit: int = 30):
 # ---------- Pantry ----------
 
 
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def quantity_number(quantity: str) -> float | None:
+    """Leading number in a free-text quantity like '2 bags' or '0.5'; None if there is none."""
+    m = _NUMBER_RE.search(quantity or "")
+    return float(m.group()) if m else None
+
+
+def pantry_below_par(r: sqlite3.Row) -> bool:
+    if r["par_level"] is None:
+        return False
+    qty = quantity_number(r["quantity"])
+    return qty is not None and qty <= r["par_level"]
+
+
+def pantry_days_to_expiry(r: sqlite3.Row) -> int | None:
+    if not r["expires_on"]:
+        return None
+    return (date.fromisoformat(r["expires_on"]) - date.today()).days
+
+
 def serialize_pantry(r: sqlite3.Row) -> dict:
-    return {**dict(r), "low": bool(r["low"])}
+    below_par = pantry_below_par(r)
+    return {
+        **dict(r),
+        "low": bool(r["low"]) or below_par,
+        "low_flag": bool(r["low"]),
+        "below_par": below_par,
+        "days_to_expiry": pantry_days_to_expiry(r),
+    }
+
+
+def _normalize_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", "", name.lower()).strip()
+
+
+def find_pantry_duplicate(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    """Existing row whose name matches case-insensitively, as a substring, or fuzzily."""
+    target = _normalize_name(name)
+    if not target:
+        return None
+    best, best_score = None, 0.0
+    for r in conn.execute("SELECT * FROM pantry_items").fetchall():
+        existing = _normalize_name(r["name"])
+        if not existing:
+            continue
+        if existing == target:
+            return r
+        # names that differ in a number ("size 4" vs "size 5") are different products
+        if _NUMBER_RE.findall(existing) != _NUMBER_RE.findall(target):
+            continue
+        shorter, longer = sorted((existing, target), key=len)
+        if len(shorter) >= 3 and shorter in longer:
+            return r
+        score = SequenceMatcher(None, existing, target).ratio()
+        if score > best_score:
+            best, best_score = r, score
+    return best if best_score >= 0.88 else None
 
 
 @app.get("/api/pantry", dependencies=HOUSEHOLD)
@@ -513,14 +582,40 @@ def list_pantry():
         return [serialize_pantry(r) for r in rows]
 
 
+def _insert_pantry_item(conn: sqlite3.Connection, body: PantryItemIn) -> dict:
+    """Insert unless a near-duplicate exists, in which case return that row flagged `duplicate`."""
+    existing = find_pantry_duplicate(conn, body.name)
+    if existing:
+        return {**serialize_pantry(existing), "duplicate": True, "requested_name": body.name.strip()}
+    cur = conn.execute(
+        "INSERT INTO pantry_items (name, category, quantity, low, par_level, expires_on, updated_by, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            body.name.strip(),
+            body.category.strip(),
+            body.quantity.strip(),
+            int(body.low),
+            body.par_level,
+            body.expires_on.isoformat() if body.expires_on else None,
+            body.updated_by.strip(),
+            now_iso(),
+        ),
+    )
+    row = conn.execute("SELECT * FROM pantry_items WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return {**serialize_pantry(row), "duplicate": False}
+
+
 @app.post("/api/pantry", status_code=201, dependencies=HOUSEHOLD)
-def create_pantry_item(body: PantryItemIn):
+def create_pantry_item(body: Union[PantryItemIn, list[PantryItemIn]]):
+    """Accepts one item or a list; a list is inserted in a single transaction and returns a list."""
     with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO pantry_items (name, category, quantity, low, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (body.name.strip(), body.category.strip(), body.quantity.strip(), int(body.low), body.updated_by.strip(), now_iso()),
-        )
-        return serialize_pantry(conn.execute("SELECT * FROM pantry_items WHERE id = ?", (cur.lastrowid,)).fetchone())
+        if isinstance(body, list):
+            if not body:
+                raise HTTPException(422, "Empty list")
+            if len(body) > 200:
+                raise HTTPException(422, "Too many items in one request")
+            return [_insert_pantry_item(conn, item) for item in body]
+        return _insert_pantry_item(conn, body)
 
 
 @app.patch("/api/pantry/{item_id}", dependencies=HOUSEHOLD)
@@ -531,6 +626,8 @@ def update_pantry_item(item_id: int, body: PantryItemPatch):
         fields = body.model_dump(exclude_unset=True, exclude={"updated_by"})
         if "low" in fields:
             fields["low"] = int(fields["low"])
+        if fields.get("expires_on") is not None:
+            fields["expires_on"] = fields["expires_on"].isoformat()
         for k in ("name", "category", "quantity"):
             if k in fields and fields[k] is not None:
                 fields[k] = fields[k].strip()
@@ -810,6 +907,67 @@ def send_test_reminder():
     except Exception as e:
         raise HTTPException(502, f"Sending failed: {e}")
     return {"ok": True}
+
+
+# ---------- Status summary ----------
+# Household-readable. Must never include medication/pickup data (see tests).
+
+
+def task_days_until_due(t: dict) -> int | None:
+    """Days until a recurring task is due (negative = overdue). None for one-off tasks."""
+    if t["frequency_days"] is None:
+        return None
+    if t["last_completed_at"] is None:
+        return 0
+    last = datetime.fromisoformat(t["last_completed_at"]).date()
+    return (last + timedelta(days=t["frequency_days"]) - date.today()).days
+
+
+def _status_task(t: dict, room: sqlite3.Row, days: int) -> dict:
+    return {
+        "id": t["id"],
+        "title": t["title"],
+        "room_slug": room["slug"],
+        "room_name": room["name"],
+        "days_until_due": days,
+        "last_completed_at": t["last_completed_at"],
+    }
+
+
+@app.get("/api/status", dependencies=HOUSEHOLD)
+def status_summary():
+    overdue, due_today, due_week = [], [], []
+    with get_conn() as conn:
+        rooms = {r["id"]: r for r in conn.execute("SELECT * FROM rooms ORDER BY sort_order, id").fetchall()}
+        tasks = conn.execute("SELECT * FROM tasks WHERE active = 1 ORDER BY sort_order, id").fetchall()
+        for row in tasks:
+            t = serialize_task(conn, row)
+            days = task_days_until_due(t)
+            if days is None:
+                continue
+            entry = _status_task(t, rooms[row["room_id"]], days)
+            if days < 0:
+                overdue.append(entry)
+            elif days == 0:
+                due_today.append(entry)
+            elif days <= 7:
+                due_week.append(entry)
+        upkeep = [
+            serialize_upkeep(conn, i)
+            for i in conn.execute("SELECT * FROM upkeep_items WHERE active = 1 ORDER BY name").fetchall()
+        ]
+        pantry = [serialize_pantry(r) for r in conn.execute("SELECT * FROM pantry_items ORDER BY name").fetchall()]
+    return {
+        "generated_on": date.today().isoformat(),
+        "tasks_overdue": overdue,
+        "tasks_due_today": due_today,
+        "tasks_due_within_7_days": due_week,
+        "upkeep_due": [u for u in upkeep if u["status"] == "due"],
+        "pantry_below_par": [p for p in pantry if p["below_par"]],
+        "pantry_expiring_within_7_days": [
+            p for p in pantry if p["days_to_expiry"] is not None and p["days_to_expiry"] <= 7
+        ],
+    }
 
 
 @app.get("/api/health")

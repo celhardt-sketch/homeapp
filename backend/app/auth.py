@@ -50,21 +50,35 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(hash_password(password, bytes.fromhex(salt_hex)), stored)
 
 
-DEFAULT_PASSWORD = {ADMIN: "admin", HOUSEHOLD: "home"}
 PASSWORD_ENV = {ADMIN: "ADMIN_PASSWORD", HOUSEHOLD: "HOUSEHOLD_PASSWORD"}
 
 
+LEGACY_DEFAULT_PASSWORD = {ADMIN: "admin", HOUSEHOLD: "home"}
+
+
+class MissingPasswordError(RuntimeError):
+    pass
+
+
+def _needs_seed(conn, role: str) -> bool:
+    stored = _get_setting(conn, PASSWORD_KEY[role])
+    return stored is None or verify_password(LEGACY_DEFAULT_PASSWORD[role], stored)
+
+
 def ensure_admin_credentials() -> None:
-    """Seed each role's password from its env var. The env var also wins while the stored
-    password is still a built-in default, so setting it after first start still takes effect."""
+    """Seed each role's password from its env var on first start. There is no default:
+    a role with no usable stored password and no env var aborts startup. A password left
+    at a legacy built-in default counts as unset."""
     with get_conn() as conn:
-        for role in ROLES:
-            stored = _get_setting(conn, PASSWORD_KEY[role])
-            env_password = os.environ.get(PASSWORD_ENV[role])
-            if stored is None:
-                _set_setting(conn, PASSWORD_KEY[role], hash_password(env_password or DEFAULT_PASSWORD[role]))
-            elif env_password and verify_password(DEFAULT_PASSWORD[role], stored):
-                _set_setting(conn, PASSWORD_KEY[role], hash_password(env_password))
+        to_seed = [role for role in ROLES if _needs_seed(conn, role)]
+        missing = [PASSWORD_ENV[role] for role in to_seed if not os.environ.get(PASSWORD_ENV[role])]
+        if missing:
+            raise MissingPasswordError(
+                f"Refusing to start: no password configured for {', '.join(missing)}. "
+                "Set the environment variable(s) and restart."
+            )
+        for role in to_seed:
+            _set_setting(conn, PASSWORD_KEY[role], hash_password(os.environ[PASSWORD_ENV[role]]))
         if _get_setting(conn, "token_secret") is None:
             _set_setting(conn, "token_secret", secrets.token_hex(32))
 
