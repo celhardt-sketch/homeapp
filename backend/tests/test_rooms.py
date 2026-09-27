@@ -129,3 +129,26 @@ def test_mcp_room_tools(mcp, client, admin_headers, susan_headers):  # noqa: F81
     assert not any(r["id"] == rid for r in _unwrap(mcp("list_rooms")))
     assert client.get("/api/rooms/boot-room", headers=susan_headers).json()["active"] is False
     assert client.get(f"/api/tasks/{task['id']}/history", headers=admin_headers).json()[0]["completed_by"] == "Susan"
+
+
+def test_startup_removes_accidental_duplicate_laundry_room(client, admin_headers):
+    """Production had id 3 'Laundry Room' (slug laundry, 4 tasks) and id 9 'Laundry Room'
+    (slug laundry-room, no tasks) from before the duplicate check. init_db deletes the empty one,
+    keeps its slug as an alias, and the check now refuses to recreate it."""
+    from app.db import get_conn, init_db
+
+    with get_conn() as conn:
+        conn.execute("DELETE FROM rooms WHERE id = 9")
+        laundry = conn.execute("SELECT * FROM rooms WHERE slug = 'laundry'").fetchone()
+        assert laundry and laundry["id"] == 3
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE room_id = 3").fetchone()[0] == 4
+        conn.execute("INSERT INTO rooms (id, slug, name, icon, sort_order) VALUES (9, 'laundry-room', 'Laundry Room', 'home', 99)")
+    init_db()
+    with get_conn() as conn:
+        assert conn.execute("SELECT 1 FROM rooms WHERE id = 9").fetchone() is None
+        assert conn.execute("SELECT COUNT(*) FROM rooms WHERE lower(name) = 'laundry room'").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE room_id = 3").fetchone()[0] == 4
+
+    assert client.get("/api/rooms/laundry-room", headers=admin_headers).json()["id"] == 3
+    r = client.post("/api/rooms", json={"name": "Laundry Room"}, headers=admin_headers)
+    assert r.status_code == 200 and r.json()["duplicate"] is True and r.json()["id"] == 3
