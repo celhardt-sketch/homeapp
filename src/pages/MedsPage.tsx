@@ -123,11 +123,12 @@ function MedCard({
 
   useEffect(() => {
     if (open) api.pickupHistory(med.id).then(setHistory).catch(() => setHistory([]))
-  }, [open, med.id, med.last_pickup_id])
+  }, [open, med.id])
 
   async function logPickup() {
     try {
       onChange(await api.logPickup(med.id, { picked_up_on: date, picked_up_by: userName }))
+      if (open) setHistory(await api.pickupHistory(med.id))
       setDate(todayIso())
     } catch (e) {
       onError((e as Error).message)
