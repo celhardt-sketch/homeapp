@@ -135,6 +135,14 @@ export interface UpkeepLog {
   reminder_sent_at: string | null
 }
 
+export interface ConnectorStatus {
+  mcp_url: string
+  connected: boolean
+  clients: { client_id: string; client_name: string; created_at: string }[]
+  active_tokens: number
+  last_used_at: string | null
+}
+
 export interface ReminderSettings {
   reminder_email: string
   email_configured: boolean
@@ -267,6 +275,8 @@ export const api = {
   upkeepHistory: (id: number) => request<UpkeepLog[]>(`/api/upkeep/${id}/logs`),
   deleteUpkeepLog: (id: number) => request<void>(`/api/upkeep-logs/${id}`, { method: 'DELETE' }),
 
+  connectorStatus: () => request<ConnectorStatus>('/api/admin/connector'),
+  revokeConnector: () => request<{ revoked_tokens: number }>('/api/admin/connector', { method: 'DELETE' }),
   reminderSettings: () => request<ReminderSettings>('/api/admin/reminders'),
   saveReminderSettings: (reminder_email: string) =>
     request<ReminderSettings>('/api/admin/reminders', { method: 'PUT', body: JSON.stringify({ reminder_email }) }),

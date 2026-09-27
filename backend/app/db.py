@@ -95,6 +95,45 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- OAuth 2.1 authorization server state for the MCP connector (see oauth.py)
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    client_id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_pending (
+    id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_codes (
+    code TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    token TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,              -- 'access' | 'refresh'
+    client_id TEXT NOT NULL,
+    scopes TEXT NOT NULL DEFAULT '',
+    pair TEXT,                       -- the other token issued alongside this one
+    expires_at REAL,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key TEXT PRIMARY KEY,
+    tool TEXT NOT NULL,
+    response TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 """
 
 
