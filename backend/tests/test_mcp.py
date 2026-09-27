@@ -23,6 +23,7 @@ TOOLS = {
     "get_home_status", "list_rooms", "list_tasks", "add_task", "complete_task", "list_upkeep",
     "log_upkeep_done", "list_pantry", "add_pantry_items", "update_pantry_item", "remove_pantry_item",
     "list_shopping", "add_to_shopping", "find",
+    "add_to_list", "list_for_person", "add_room", "rename_room", "archive_room",
 }
 
 
@@ -68,8 +69,8 @@ def _unwrap(result):
     return result["result"] if isinstance(result, dict) and set(result) == {"result"} else result
 
 
-# 1. handshake + 14 tools
-def test_handshake_lists_all_14_tools(server_url, client):
+# 1. handshake + all tools
+def test_handshake_lists_all_tools(server_url, client):
     token = oauth_connect(client)["access_token"]
 
     async def go():
@@ -187,8 +188,8 @@ def test_burst_of_twenty_writes_is_not_rate_limited(mcp):
 
 
 # 7. recurring task completion schedules the next date
-def test_complete_recurring_task_schedules_next(mcp, client, household_headers):
-    room = client.post("/api/rooms", json={"name": "Scullery"}, headers=household_headers).json()
+def test_complete_recurring_task_schedules_next(mcp, client, household_headers, admin_headers):
+    room = client.post("/api/rooms", json={"name": "Scullery"}, headers=admin_headers).json()
     r = client.post("/api/tasks", json={"room_id": room["id"], "title": "Descale the kettle", "frequency_days": 14}, headers=household_headers)
     assert r.status_code == 201
     res = mcp("complete_task", task="descale kettle", done_by="Courtney", note="need more descaler")

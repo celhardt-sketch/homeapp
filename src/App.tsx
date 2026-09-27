@@ -1,8 +1,8 @@
+import { useCallback, useEffect, useState } from 'react'
 import { Link, NavLink, Route, Routes } from 'react-router-dom'
-import { Home, Package, Pill, Settings, ShoppingCart, User, Wrench } from 'lucide-react'
-import { useUserName } from './useUserName'
+import { Bell, Home, ListChecks, Package, Pill, Settings, ShoppingCart, Wrench } from 'lucide-react'
+import { api, formatDate, type Notification } from './api'
 import { useAdminAuth } from './useAdminAuth'
-import NamePrompt from './components/NamePrompt'
 import LoginForm from './components/LoginForm'
 import AdminOnly from './components/AdminOnly'
 import HomePage from './pages/HomePage'
@@ -12,12 +12,14 @@ import ShoppingPage from './pages/ShoppingPage'
 import PantryPage from './pages/PantryPage'
 import MedsPage from './pages/MedsPage'
 import UpkeepPage from './pages/UpkeepPage'
+import MyListPage from './pages/MyListPage'
 
 export default function App() {
-  const { name, setName } = useUserName()
-  const { role, login, logout } = useAdminAuth()
-  const loggedIn = role !== null && role !== undefined
-  const isAdmin = role === 'admin'
+  const { session, login, logout } = useAdminAuth()
+  const loggedIn = session !== null && session !== undefined
+  const isAdmin = session?.role === 'admin'
+  const user = session?.user ?? null
+  const name = user?.name ?? ''
 
   return (
     <div className="mx-auto flex min-h-screen max-w-xl flex-col">
@@ -25,27 +27,22 @@ export default function App() {
         <Link to="/" className="flex items-center gap-2 font-semibold text-teal-800">
           <Home className="size-5" /> Home Maintenance
         </Link>
-        <button
-          onClick={() => setName('')}
-          className="flex items-center gap-1 rounded-full bg-stone-100 px-3 py-1 text-sm text-stone-600"
-          title="Change who you are"
-        >
-          <User className="size-4" /> {name || 'Set name'}
-        </button>
+        {user && <NotificationBell />}
       </header>
 
       <main className="flex-1 px-4 pb-24 pt-4">
-        {role === undefined && <p className="text-center text-sm text-stone-500">Loading…</p>}
-        {role === null && <LoginForm onLogin={login} />}
+        {session === undefined && <p className="text-center text-sm text-stone-500">Loading…</p>}
+        {session === null && <LoginForm onLogin={login} />}
         {loggedIn && (
           <Routes>
-            <Route path="/" element={<HomePage isAdmin={isAdmin} />} />
+            <Route path="/" element={user ? <MyListPage me={user} /> : <HomePage isAdmin={isAdmin} />} />
+            <Route path="/rooms" element={<HomePage isAdmin={isAdmin} />} />
             <Route path="/r/:slug" element={<RoomPage userName={name} />} />
-            <Route path="/shopping" element={<ShoppingPage userName={name} />} />
+            <Route path="/shopping" element={<ShoppingPage userName={name} canAssign={isAdmin} myUserId={user?.id ?? null} />} />
             <Route path="/pantry" element={<PantryPage userName={name} />} />
             <Route path="/meds" element={isAdmin ? <MedsPage userName={name} /> : <AdminOnly what="Medications" />} />
             <Route path="/upkeep" element={<UpkeepPage userName={name} />} />
-            <Route path="/admin" element={<AdminPage isAdmin={isAdmin} onLogout={logout} />} />
+            <Route path="/admin" element={<AdminPage session={session} onLogout={logout} />} />
             <Route path="*" element={<p className="text-center text-stone-500">Page not found.</p>} />
           </Routes>
         )}
@@ -53,7 +50,8 @@ export default function App() {
 
       <nav className="fixed inset-x-0 bottom-0 z-10 border-t border-stone-200 bg-white pb-[env(safe-area-inset-bottom)]">
         <div className="mx-auto flex max-w-xl justify-around">
-          <Tab to="/" icon={<Home className="size-5" />} label="Rooms" />
+          <Tab to="/" icon={<ListChecks className="size-5" />} label="My list" />
+          <Tab to="/rooms" icon={<Home className="size-5" />} label="Rooms" />
           <Tab to="/upkeep" icon={<Wrench className="size-5" />} label="Upkeep" />
           <Tab to="/pantry" icon={<Package className="size-5" />} label="Pantry" />
           <Tab to="/meds" icon={<Pill className="size-5" />} label="Meds" />
@@ -61,8 +59,61 @@ export default function App() {
           <Tab to="/admin" icon={<Settings className="size-5" />} label="Manage" />
         </div>
       </nav>
+    </div>
+  )
+}
 
-      {loggedIn && !name && <NamePrompt onSubmit={setName} />}
+function NotificationBell() {
+  const [items, setItems] = useState<Notification[]>([])
+  const [open, setOpen] = useState(false)
+
+  const load = useCallback(() => {
+    api.notifications().then(setItems).catch(() => {})
+  }, [])
+  useEffect(() => {
+    load()
+    const t = setInterval(load, 60_000)
+    return () => clearInterval(t)
+  }, [load])
+
+  const unread = items.filter((n) => !n.read_at).length
+
+  async function toggle() {
+    const next = !open
+    setOpen(next)
+    if (next && unread > 0) {
+      await api.markNotificationsRead().catch(() => {})
+      load()
+    }
+  }
+
+  return (
+    <div className="relative">
+      <button
+        onClick={toggle}
+        className="relative rounded-full bg-stone-100 p-2 text-stone-600"
+        aria-label={`Notifications${unread ? ` (${unread} unread)` : ''}`}
+      >
+        <Bell className="size-4" />
+        {unread > 0 && (
+          <span className="absolute -right-0.5 -top-0.5 flex size-4 items-center justify-center rounded-full bg-red-600 text-[10px] font-semibold text-white">
+            {unread}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="absolute right-0 mt-2 w-72 rounded-xl border border-stone-200 bg-white p-2 shadow-lg">
+          {items.length === 0 && <p className="p-2 text-sm text-stone-500">Nothing new.</p>}
+          <ul className="max-h-80 divide-y divide-stone-100 overflow-y-auto">
+            {items.map((n) => (
+              <li key={n.id} className="p-2 text-sm">
+                <p>{n.message}</p>
+                <p className="text-xs text-stone-500">{formatDate(n.created_at)}</p>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   )
 }
@@ -73,7 +124,7 @@ function Tab({ to, icon, label }: { to: string; icon: React.ReactNode; label: st
       to={to}
       end={to === '/'}
       className={({ isActive }) =>
-        `flex flex-1 flex-col items-center gap-0.5 py-2 text-xs ${isActive ? 'text-teal-700' : 'text-stone-500'}`
+        `flex flex-1 flex-col items-center gap-0.5 py-2 text-[11px] ${isActive ? 'text-teal-700' : 'text-stone-500'}`
       }
     >
       {icon}

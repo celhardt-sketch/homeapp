@@ -84,7 +84,7 @@ function TaskCard({
 
   const complete = () =>
     run(async () => {
-      const updated = await api.completeTask(task.id, userName)
+      const updated = await api.completeTask(task.id)
       onChange(updated)
       const [latest] = await api.history(task.id)
       setJustDone(latest ?? null)

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Bot, Copy, KeyRound, LogOut, Mail, Nfc, Pencil, Plus, Trash2, X } from 'lucide-react'
+import { Archive, ArchiveRestore, Bot, Copy, KeyRound, LogOut, Mail, Nfc, Pencil, Plus, Trash2, Users, X } from 'lucide-react'
 import {
   api,
   formatDay,
@@ -11,8 +11,11 @@ import {
   type Room,
   type RoomSummary,
   type Task,
+  type User,
+  type UserRole,
 } from '../api'
 import { ROOM_ICONS, RoomIcon } from '../icons'
+import type { Session } from '../useAdminAuth'
 
 const FREQUENCIES: { label: string; value: number | null }[] = [
   { label: 'As needed', value: null },
@@ -25,16 +28,24 @@ const FREQUENCIES: { label: string; value: number | null }[] = [
   { label: 'Yearly', value: 365 },
 ]
 
-export default function AdminPage({ isAdmin, onLogout }: { isAdmin: boolean; onLogout: () => void }) {
+export default function AdminPage({ session, onLogout }: { session: Session; onLogout: () => void }) {
+  const isAdmin = session.role === 'admin'
   const [rooms, setRooms] = useState<RoomSummary[]>([])
+  const [showArchived, setShowArchived] = useState(false)
   const [selected, setSelected] = useState<Room | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [users, setUsers] = useState<User[]>([])
 
   const loadRooms = useCallback(() => {
-    api.rooms().then(setRooms).catch((e: Error) => setError(e.message))
-  }, [])
+    api.rooms(showArchived).then(setRooms).catch((e: Error) => setError(e.message))
+  }, [showArchived])
   useEffect(loadRooms, [loadRooms])
+  const loadUsers = useCallback(() => {
+    api.users().then(setUsers).catch(() => setUsers([]))
+  }, [])
+  useEffect(loadUsers, [loadUsers])
 
   async function openRoom(slug: string) {
     setSelected(await api.room(slug))
@@ -60,16 +71,14 @@ export default function AdminPage({ isAdmin, onLogout }: { isAdmin: boolean; onL
           </p>
         </div>
         <div className="flex shrink-0 gap-1">
-          {isAdmin && (
-            <button
-              onClick={() => setShowPassword((v) => !v)}
-              className="rounded-lg p-2 text-stone-500 hover:bg-stone-200"
-              title="Passwords"
-              aria-label="Passwords"
-            >
-              <KeyRound className="size-4" />
-            </button>
-          )}
+          <button
+            onClick={() => setShowPassword((v) => !v)}
+            className="rounded-lg p-2 text-stone-500 hover:bg-stone-200"
+            title="Change my password"
+            aria-label="Change my password"
+          >
+            <KeyRound className="size-4" />
+          </button>
           <button
             onClick={onLogout}
             className="rounded-lg p-2 text-stone-500 hover:bg-stone-200"
@@ -82,21 +91,18 @@ export default function AdminPage({ isAdmin, onLogout }: { isAdmin: boolean; onL
       </div>
 
       {error && <p className="rounded-lg bg-red-50 p-2 text-sm text-red-700">{error}</p>}
+      {notice && <p className="rounded-lg bg-amber-50 p-2 text-sm text-amber-800">{notice}</p>}
 
       {!isAdmin && (
         <p className="rounded-lg bg-amber-50 p-2 text-sm text-amber-800">
-          Household login: you can edit rooms and tasks. Deleting rooms, passwords and reminder settings need the
-          admin password — ask Mom.
+          You're logged in as {session.user?.name}. You can edit tasks; adding, renaming or archiving rooms, people and
+          reminder settings are for admins — ask Mom.
         </p>
       )}
 
-      {showPassword && isAdmin && (
-        <>
-          <ChangePasswordForm onDone={() => setShowPassword(false)} />
-          <HouseholdPasswordForm />
-        </>
-      )}
+      {showPassword && <ChangePasswordForm onDone={() => setShowPassword(false)} />}
 
+      {!selected && isAdmin && <UsersCard me={session.user} users={users} onChange={loadUsers} />}
       {!selected && isAdmin && <ReminderSettingsCard />}
       {!selected && isAdmin && <ConnectorCard />}
 
@@ -104,12 +110,15 @@ export default function AdminPage({ isAdmin, onLogout }: { isAdmin: boolean; onL
         <>
           <ul className="space-y-2">
             {rooms.map((r) => (
-              <li key={r.id} className="flex items-center gap-3 rounded-xl bg-white p-3 shadow-sm">
+              <li key={r.id} className={`flex items-center gap-3 rounded-xl bg-white p-3 shadow-sm ${r.active ? '' : 'opacity-60'}`}>
                 <span className="flex size-9 items-center justify-center rounded-lg bg-teal-50 text-teal-700">
                   <RoomIcon name={r.icon} className="size-5" />
                 </span>
                 <button onClick={() => openRoom(r.slug)} className="flex-1 text-left">
-                  <span className="block font-medium">{r.name}</span>
+                  <span className="block font-medium">
+                    {r.name}
+                    {!r.active && <span className="ml-2 rounded-full bg-stone-200 px-2 py-0.5 text-xs font-normal text-stone-600">archived</span>}
+                  </span>
                   <span className="block text-xs text-stone-500">
                     {r.task_count} task{r.task_count === 1 ? '' : 's'} · tag id: {r.slug}
                   </span>
@@ -120,19 +129,31 @@ export default function AdminPage({ isAdmin, onLogout }: { isAdmin: boolean; onL
               </li>
             ))}
           </ul>
-          <NewRoomForm
-            onCreate={(body) =>
-              withError(async () => {
-                const room = await api.createRoom(body)
-                loadRooms()
-                setSelected(room)
-              })
-            }
-          />
+          {isAdmin && (
+            <label className="flex items-center gap-2 text-sm text-stone-500">
+              <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+              Show archived rooms
+            </label>
+          )}
+          {isAdmin && (
+            <NewRoomForm
+              onCreate={(body) =>
+                withError(async () => {
+                  setNotice(null)
+                  const room = await api.createRoom(body)
+                  if (room.duplicate) setNotice(`"${body.name}" looks like the existing room "${room.name}", so nothing was added.`)
+                  loadRooms()
+                  setSelected(room)
+                })
+              }
+            />
+          )}
         </>
       ) : (
         <RoomEditor
           room={selected}
+          isAdmin={isAdmin}
+          users={users}
           onBack={() => {
             setSelected(null)
             loadRooms()
@@ -335,7 +356,7 @@ function ChangePasswordForm({ onDone }: { onDone: () => void }) {
       return
     }
     try {
-      const { token } = await api.adminChangePassword(current, next)
+      const { token } = await api.changeOwnPassword(current, next)
       setAdminToken(token)
       setSaved(true)
       setTimeout(onDone, 1200)
@@ -348,7 +369,7 @@ function ChangePasswordForm({ onDone }: { onDone: () => void }) {
   return (
     <form onSubmit={submit} className="space-y-2 rounded-xl bg-white p-4 shadow-sm">
       <div className="flex items-center justify-between">
-        <h2 className="font-medium">Change admin password</h2>
+        <h2 className="font-medium">Change my password</h2>
         <button type="button" onClick={onDone} className="text-stone-500" aria-label="Close">
           <X className="size-4" />
         </button>
@@ -369,47 +390,102 @@ function ChangePasswordForm({ onDone }: { onDone: () => void }) {
   )
 }
 
-function HouseholdPasswordForm() {
-  const [next, setNext] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const [saved, setSaved] = useState(false)
+function UsersCard({ me, users, onChange }: { me: User | null; users: User[]; onChange: () => void }) {
+  const [name, setName] = useState('')
+  const [role, setRole] = useState<UserRole>('member')
+  const [password, setPassword] = useState('')
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+  const inputCls = 'rounded-lg border border-stone-300 px-3 py-2 text-sm outline-none focus:border-teal-600'
 
-  async function submit(e: React.FormEvent) {
-    e.preventDefault()
-    setError(null)
-    setSaved(false)
+  async function run(fn: () => Promise<string>) {
+    setMsg(null)
     try {
-      await api.setHouseholdPassword(next)
-      setNext('')
-      setSaved(true)
-    } catch (err) {
-      setError((err as Error).message)
+      setMsg({ ok: true, text: await fn() })
+      onChange()
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message })
     }
   }
 
   return (
-    <form onSubmit={submit} className="space-y-2 rounded-xl bg-white p-4 shadow-sm">
-      <h2 className="font-medium">Household password</h2>
-      <p className="text-xs text-stone-500">
-        The password family members enter on their phones. Changing it logs every household device out.
-      </p>
-      <input
-        type="password"
-        value={next}
-        onChange={(e) => setNext(e.target.value)}
-        placeholder="New household password (min 4 characters)"
-        className="w-full rounded-lg border border-stone-300 px-3 py-2 text-sm outline-none focus:border-teal-600"
-      />
-      {error && <p className="rounded-lg bg-red-50 p-2 text-sm text-red-700">{error}</p>}
-      {saved && <p className="rounded-lg bg-green-50 p-2 text-sm text-green-700">Household password updated.</p>}
-      <button
-        type="submit"
-        disabled={next.length < 4}
-        className="rounded-lg bg-teal-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+    <section className="rounded-xl bg-white p-4 shadow-sm">
+      <h2 className="mb-1 flex items-center gap-2 font-medium">
+        <Users className="size-5 text-teal-700" /> People
+      </h2>
+      <p className="mb-2 text-sm text-stone-500">Everyone logs in with their own name and password; admins can also manage rooms, people and medications.</p>
+      <ul className="mb-3 divide-y divide-stone-100">
+        {users.map((u) => (
+          <li key={u.id} className="flex flex-wrap items-center gap-2 py-2 text-sm">
+            <span className="font-medium">{u.name}</span>
+            <span className="rounded-full bg-stone-100 px-2 py-0.5 text-xs text-stone-600">{u.role}</span>
+            {u.id !== me?.id && (
+              <span className="ml-auto flex gap-2 text-xs">
+                <button
+                  onClick={() => run(async () => ((await api.updateUser(u.id, { role: u.role === 'admin' ? 'member' : 'admin' })), `${u.name} is now ${u.role === 'admin' ? 'a member' : 'an admin'}.`))}
+                  className="text-teal-700"
+                >
+                  Make {u.role === 'admin' ? 'member' : 'admin'}
+                </button>
+                <button
+                  onClick={() => {
+                    const next = prompt(`New password for ${u.name} (min 4 characters):`)
+                    if (next && next.length >= 4) run(async () => ((await api.updateUser(u.id, { password: next })), `${u.name}'s password was reset; their devices will need to log in again.`))
+                  }}
+                  className="text-teal-700"
+                >
+                  Reset password
+                </button>
+                <button
+                  onClick={() => {
+                    if (confirm(`Remove ${u.name}? Their completed tasks stay in the history.`))
+                      run(async () => ((await api.updateUser(u.id, { active: false })), `${u.name} can no longer log in.`))
+                  }}
+                  className="text-red-700"
+                >
+                  Remove
+                </button>
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault()
+          run(async () => {
+            const u = await api.createUser({ name: name.trim(), role, password })
+            setName('')
+            setPassword('')
+            return `Added ${u.name}.`
+          })
+        }}
+        className="flex flex-wrap gap-2"
       >
-        Set household password
-      </button>
-    </form>
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="First name" className={`${inputCls} flex-1`} />
+        <select value={role} onChange={(e) => setRole(e.target.value as UserRole)} className={`${inputCls} bg-white`}>
+          <option value="member">member</option>
+          <option value="admin">admin</option>
+        </select>
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="Password"
+          autoComplete="new-password"
+          className={`${inputCls} flex-1`}
+        />
+        <button
+          type="submit"
+          disabled={!name.trim() || password.length < 4}
+          className="flex items-center gap-1 rounded-lg bg-teal-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+        >
+          <Plus className="size-4" /> Add person
+        </button>
+      </form>
+      {msg && (
+        <p className={`mt-2 rounded-lg p-2 text-sm ${msg.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>{msg.text}</p>
+      )}
+    </section>
   )
 }
 
@@ -467,12 +543,16 @@ function IconPicker({ value, onChange }: { value: string; onChange: (v: string) 
 
 function RoomEditor({
   room,
+  isAdmin,
+  users,
   onBack,
   onChange,
   onDelete,
   onError,
 }: {
   room: Room
+  isAdmin: boolean
+  users: User[]
   onBack: () => void
   onChange: (r: Room) => void
   onDelete?: () => void
@@ -486,7 +566,18 @@ function RoomEditor({
 
   async function save() {
     try {
-      onChange(await api.updateRoom(room.id, { name, slug, icon }))
+      const body = slug !== room.slug ? { name, slug, icon } : { name, icon }
+      const updated = await api.updateRoom(room.id, body)
+      setSlug(updated.slug)
+      onChange(updated)
+    } catch (e) {
+      onError((e as Error).message)
+    }
+  }
+
+  async function setActive(active: boolean) {
+    try {
+      onChange(await api.updateRoom(room.id, { active }))
     } catch (e) {
       onError((e as Error).message)
     }
@@ -506,41 +597,58 @@ function RoomEditor({
         ← All rooms
       </button>
 
-      <section className="rounded-xl bg-white p-4 shadow-sm">
-        <h2 className="mb-3 font-medium">Room details</h2>
-        <label className="block text-xs font-medium text-stone-500">Name</label>
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          className="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 text-sm outline-none focus:border-teal-600"
-        />
-        <label className="mt-3 block text-xs font-medium text-stone-500">Tag id (used in the link)</label>
-        <input
-          value={slug}
-          onChange={(e) => setSlug(e.target.value)}
-          className="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 font-mono text-sm outline-none focus:border-teal-600"
-        />
-        <IconPicker value={icon} onChange={setIcon} />
-        <div className="mt-3 flex items-center justify-between">
-          <button
-            onClick={save}
-            disabled={!dirty || !name.trim() || !slug.trim()}
-            className="rounded-lg bg-teal-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
-          >
-            Save
-          </button>
-          {onDelete && (
+      {isAdmin && (
+        <section className="rounded-xl bg-white p-4 shadow-sm">
+          <h2 className="mb-3 font-medium">
+            Room details
+            {!room.active && <span className="ml-2 rounded-full bg-stone-200 px-2 py-0.5 text-xs font-normal text-stone-600">archived</span>}
+          </h2>
+          <label className="block text-xs font-medium text-stone-500">Name</label>
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 text-sm outline-none focus:border-teal-600"
+          />
+          <label className="mt-3 block text-xs font-medium text-stone-500">Tag id (used in the link)</label>
+          <input
+            value={slug}
+            onChange={(e) => setSlug(e.target.value)}
+            className="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 font-mono text-sm outline-none focus:border-teal-600"
+          />
+          <p className="mt-1 text-xs text-stone-500">Renaming keeps the old tag id working, so tags already on the wall don't break.</p>
+          <IconPicker value={icon} onChange={setIcon} />
+          <div className="mt-3 flex flex-wrap items-center gap-3">
             <button
-              onClick={() => {
-                if (confirm(`Delete "${room.name}" and all of its tasks and history?`)) onDelete()
-              }}
-              className="flex items-center gap-1 text-sm text-red-700"
+              onClick={save}
+              disabled={!dirty || !name.trim() || !slug.trim()}
+              className="rounded-lg bg-teal-700 px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
             >
-              <Trash2 className="size-4" /> Delete room
+              Save
             </button>
-          )}
-        </div>
-      </section>
+            <button onClick={() => setActive(!room.active)} className="flex items-center gap-1 text-sm text-stone-600">
+              {room.active ? (
+                <>
+                  <Archive className="size-4" /> Archive room
+                </>
+              ) : (
+                <>
+                  <ArchiveRestore className="size-4" /> Restore room
+                </>
+              )}
+            </button>
+            {onDelete && (
+              <button
+                onClick={() => {
+                  if (confirm(`Delete "${room.name}"? This only works once it has no tasks; archive it to keep the history.`)) onDelete()
+                }}
+                className="ml-auto flex items-center gap-1 text-sm text-red-700"
+              >
+                <Trash2 className="size-4" /> Delete room
+              </button>
+            )}
+          </div>
+        </section>
+      )}
 
       <section className="rounded-xl border border-teal-200 bg-teal-50 p-4">
         <h2 className="mb-1 flex items-center gap-2 font-medium text-teal-900">
@@ -562,17 +670,21 @@ function RoomEditor({
         </Link>
       </section>
 
-      <TaskEditor room={room} onChange={onChange} onError={onError} />
+      <TaskEditor room={room} canAssign={isAdmin} users={users} onChange={onChange} onError={onError} />
     </div>
   )
 }
 
 function TaskEditor({
   room,
+  canAssign,
+  users,
   onChange,
   onError,
 }: {
   room: Room
+  canAssign: boolean
+  users: User[]
   onChange: (r: Room) => void
   onError: (msg: string) => void
 }) {
@@ -580,12 +692,14 @@ function TaskEditor({
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [frequency, setFrequency] = useState<number | null>(30)
+  const [assignee, setAssignee] = useState<number | null>(null)
 
   function startEdit(t: Task) {
     setEditing(t)
     setTitle(t.title)
     setDescription(t.description)
     setFrequency(t.frequency_days)
+    setAssignee(t.assignee_id)
   }
 
   function reset() {
@@ -593,6 +707,7 @@ function TaskEditor({
     setTitle('')
     setDescription('')
     setFrequency(30)
+    setAssignee(null)
   }
 
   async function submit(e: React.FormEvent) {
@@ -600,10 +715,11 @@ function TaskEditor({
     if (!title.trim()) return
     try {
       if (editing) {
-        const updated = await api.updateTask(editing.id, { title, description, frequency_days: frequency ?? 0 })
+        const body = { title, description, frequency_days: frequency ?? 0, ...(canAssign && assignee !== editing.assignee_id ? { assignee_id: assignee } : {}) }
+        const updated = await api.updateTask(editing.id, body)
         onChange({ ...room, tasks: room.tasks.map((t) => (t.id === updated.id ? updated : t)) })
       } else {
-        const created = await api.createTask({ room_id: room.id, title, description, frequency_days: frequency })
+        const created = await api.createTask({ room_id: room.id, title, description, frequency_days: frequency, ...(canAssign ? { assignee_id: assignee } : {}) })
         onChange({ ...room, tasks: [...room.tasks, created] })
       }
       reset()
@@ -632,7 +748,10 @@ function TaskEditor({
           <li key={t.id} className="flex items-center gap-2 py-2">
             <div className="flex-1">
               <p className="text-sm font-medium">{t.title}</p>
-              <p className="text-xs text-stone-500">{formatFrequency(t.frequency_days)}</p>
+              <p className="text-xs text-stone-500">
+                {formatFrequency(t.frequency_days)}
+                {t.assignee && ` · ${t.assignee}`}
+              </p>
             </div>
             <button onClick={() => startEdit(t)} className="p-1.5 text-stone-500" aria-label="Edit task">
               <Pencil className="size-4" />
@@ -676,6 +795,20 @@ function TaskEditor({
             </option>
           ))}
         </select>
+        {canAssign && (
+          <select
+            value={assignee ?? ''}
+            onChange={(e) => setAssignee(e.target.value === '' ? null : Number(e.target.value))}
+            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm outline-none focus:border-teal-600"
+          >
+            <option value="">Nobody in particular</option>
+            {users.map((u) => (
+              <option key={u.id} value={u.id}>
+                Assign to {u.name}
+              </option>
+            ))}
+          </select>
+        )}
         <button
           type="submit"
           disabled={!title.trim()}

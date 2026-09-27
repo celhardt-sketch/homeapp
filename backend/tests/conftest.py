@@ -7,9 +7,21 @@ from urllib.parse import parse_qs, urlparse
 
 # app.db reads DATA_DIR at import time, so set it before anything imports the app.
 os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="hm-test-")
-os.environ["ADMIN_PASSWORD"] = "admin-test-password"
-os.environ["HOUSEHOLD_PASSWORD"] = "household-test-password"
+os.environ["HOME_USERS"] = "Courtney:admin,Magnus:admin,Susan,Vanessa"
+os.environ["PASSWORD_COURTNEY"] = "admin-test-password"
+os.environ["PASSWORD_MAGNUS"] = "magnus-test-password"
+os.environ["PASSWORD_SUSAN"] = "susan-test-password"
+os.environ["PASSWORD_VANESSA"] = "vanessa-test-password"
+os.environ.pop("ADMIN_PASSWORD", None)
+os.environ.pop("HOUSEHOLD_PASSWORD", None)
 os.environ["PUBLIC_URL"] = "http://localhost"
+
+PASSWORDS = {
+    "Courtney": "admin-test-password",
+    "Magnus": "magnus-test-password",
+    "Susan": "susan-test-password",
+    "Vanessa": "vanessa-test-password",
+}
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -23,21 +35,39 @@ def client():
         yield c
 
 
-def _login(client, password):
-    r = client.post("/api/login", json={"password": password})
-    assert r.status_code == 200
+def _login(client, name, password=None):
+    r = client.post("/api/login", json={"name": name, "password": password or PASSWORDS[name]})
+    assert r.status_code == 200, r.text
     return r.json()
+
+
+def headers_for(client, name, password=None) -> dict:
+    return {"Authorization": f"Bearer {_login(client, name, password)['token']}"}
 
 
 @pytest.fixture(scope="session")
 def admin_headers(client):
-    return {"Authorization": f"Bearer {_login(client, 'admin-test-password')['token']}"}
+    return headers_for(client, "Courtney")
 
 
 @pytest.fixture
 def household_headers(client):
-    # function-scoped: a password-change test bumps the household token version
-    return {"Authorization": f"Bearer {_login(client, 'household-test-password')['token']}"}
+    """A non-admin named user (Susan). Function-scoped: password changes bump token versions."""
+    return headers_for(client, "Susan")
+
+
+@pytest.fixture
+def susan_headers(client):
+    return headers_for(client, "Susan")
+
+
+@pytest.fixture
+def vanessa_headers(client):
+    return headers_for(client, "Vanessa")
+
+
+def user_id(client, admin_headers, name) -> int:
+    return next(u["id"] for u in client.get("/api/users", headers=admin_headers).json() if u["name"] == name)
 
 
 def oauth_connect(client, admin_password="admin-test-password", client_name="Test Claude") -> dict:

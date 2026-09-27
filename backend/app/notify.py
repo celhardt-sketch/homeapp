@@ -121,16 +121,51 @@ def due_upkeep() -> list[dict]:
     return out
 
 
+def pending_assignment_notifications() -> list[dict]:
+    """Assignment notifications not yet emailed, with the person's name and email (may be blank)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT n.id, n.kind, n.ref_id, n.message, n.created_by, n.created_at, n.read_at,
+                   u.id AS user_id, u.name AS user_name, u.email
+            FROM notifications n JOIN users u ON u.id = n.user_id
+            WHERE n.emailed_at IS NULL
+            ORDER BY n.created_at, n.id
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def send_assignment_notifications() -> int:
+    """Email each pending assignment to the assignee (one email per assignment, never a digest).
+    People without an email address only get the in-app notification."""
+    if not email_configured():
+        return 0
+    sent = 0
+    for n in pending_assignment_notifications():
+        if not n["email"]:
+            continue
+        send_email(n["email"], f"Home: {n['message']}", f"{n['message']}\n\nOpen the app to see your list.")
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE notifications SET emailed_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(timespec="seconds"), n["id"]),
+            )
+        sent += 1
+    return sent
+
+
 def send_due_reminders() -> int:
     if not email_configured():
         return 0
+    sent_assignments = send_assignment_notifications()
     to = get_reminder_email()
     if not to:
-        return 0
+        return sent_assignments
     meds = due_pickups()
     upkeep = due_upkeep()
     if not meds and not upkeep:
-        return 0
+        return sent_assignments
     sections = []
     if meds:
         sections.append(
@@ -162,7 +197,7 @@ def send_due_reminders() -> int:
             "UPDATE upkeep_logs SET reminder_sent_at = ? WHERE id = ?",
             [(now, d["log_id"]) for d in upkeep],
         )
-    return len(names)
+    return len(names) + sent_assignments
 
 
 async def reminder_loop() -> None:

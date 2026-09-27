@@ -15,6 +15,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any
 
+from fastapi import Response
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
@@ -46,6 +47,9 @@ def build_mcp() -> FastMCP:
         tools=[
             get_home_status,
             list_rooms,
+            add_room,
+            rename_room,
+            archive_room,
             list_tasks,
             add_task,
             complete_task,
@@ -57,6 +61,8 @@ def build_mcp() -> FastMCP:
             remove_pantry_item,
             list_shopping,
             add_to_shopping,
+            add_to_list,
+            list_for_person,
             find,
         ],
     )
@@ -108,7 +114,10 @@ def _room_brief(r: dict) -> dict:
 
 
 def _all_rooms(conn) -> list[dict]:
-    return [core.serialize_room(conn, r, with_tasks=False) for r in conn.execute("SELECT * FROM rooms ORDER BY sort_order, id")]
+    return [
+        core.serialize_room(conn, r, with_tasks=False)
+        for r in conn.execute("SELECT * FROM rooms WHERE active = 1 ORDER BY sort_order, id")
+    ]
 
 
 def _resolve_room(conn, room: str) -> dict:
@@ -128,13 +137,12 @@ class _AmbiguousError(Exception):
         self.payload = payload
 
 
-def _all_tasks(conn) -> list[dict]:
-    rooms = {r["id"]: r for r in conn.execute("SELECT * FROM rooms")}
+def _all_tasks(conn, include_done: bool = False) -> list[dict]:
     out = []
-    for row in conn.execute("SELECT * FROM tasks WHERE active = 1 ORDER BY sort_order, id"):
+    for row in conn.execute(core.ACTIVE_TASKS_SQL):
         t = core.serialize_task(conn, row)
-        room = rooms[row["room_id"]]
-        t["room_name"], t["room_slug"] = room["name"], room["slug"]
+        if t["done"] and not include_done:
+            continue
         t["days_until_due"] = core.task_days_until_due(t)
         t["due_on"] = (date.today() + timedelta(days=t["days_until_due"])).isoformat() if t["days_until_due"] is not None else None
         out.append(t)
@@ -146,13 +154,21 @@ def _task_brief(t: dict) -> dict:
         "id": t["id"],
         "title": t["title"],
         "room": t["room_name"],
+        "assignee": t["assignee"],
         "status": t["status"],
+        "overdue": t["status"] == "overdue",
         "due_on": t["due_on"],
         "frequency_days": t["frequency_days"],
+        "done": t["done"],
+        "created_at": t["created_at"],
         "last_completed_at": t["last_completed_at"],
         "last_completed_by": t["last_completed_by"],
         "notes": [n["body"] for n in t["notes"]],
     }
+
+
+def _task_room_label(t: dict) -> str:
+    return t["room_name"] or (f"{t['assignee']}'s list" if t["assignee"] else "no room")
 
 
 def _resolve_task(conn, task: str) -> dict:
@@ -161,7 +177,7 @@ def _resolve_task(conn, task: str) -> dict:
     if isinstance(res, NoMatch) or isinstance(res, Ambiguous):
         # "bathroom mirror in the pink bathroom": try title + room together
         for t in tasks:
-            t["_full"] = f"{t['title']} {t['room_name']}"
+            t["_full"] = f"{t['title']} {_task_room_label(t)}"
         res2 = resolve(task, tasks, name_key="_full")
         if isinstance(res2, Match) or (isinstance(res2, Ambiguous) and isinstance(res, NoMatch)):
             res = res2
@@ -169,7 +185,33 @@ def _resolve_task(conn, task: str) -> dict:
         return res.item
     if isinstance(res, Ambiguous):
         raise _AmbiguousError(_disambiguation("task", task, [_task_brief(c) for c in res.candidates]))
-    raise _no_match("task", task, [{"name": f"{t['title']} ({t['room_name']})"} for t in res.nearest])
+    raise _no_match("task", task, [{"name": f"{t['title']} ({_task_room_label(t)})"} for t in res.nearest])
+
+
+def _all_people(conn) -> list[dict]:
+    return [core.auth.public_user(r) for r in conn.execute("SELECT * FROM users WHERE active = 1 ORDER BY id")]
+
+
+class _UnknownPerson(Exception):
+    """Not an error to Claude: the tool answers with the list of people and changes nothing."""
+
+    def __init__(self, person: str, names: list[str]):
+        self.payload = {
+            "created": False,
+            "unknown_person": person,
+            "people": names,
+            "message": f"Nobody here is called '{person}'. The people are: {', '.join(names)}. Who did you mean?",
+        }
+
+
+def _resolve_person(conn, person: str) -> dict:
+    """First name, case-insensitive. No fuzzy guessing: an unknown name lists everyone instead."""
+    people = _all_people(conn)
+    wanted = (person or "").strip().lower()
+    for p in people:
+        if p["name"].lower() == wanted or (wanted.isdigit() and p["id"] == int(wanted)):
+            return p
+    raise _UnknownPerson(person, [p["name"] for p in people])
 
 
 def _all_upkeep(conn) -> list[dict]:
@@ -266,10 +308,13 @@ def _run(fn):
     """Turn a helper's disambiguation into a normal result and HTTP errors into plain sentences."""
     try:
         return fn()
-    except _AmbiguousError as e:
+    except (_AmbiguousError, _UnknownPerson) as e:
         return e.payload
     except core.HTTPException as e:
         raise ToolError(str(e.detail))
+
+
+_ACTOR = core.CONNECTOR_ACTOR
 
 
 # ---------- tools ----------
@@ -291,6 +336,65 @@ def list_rooms() -> list[dict]:
         ]
 
 
+def add_room(
+    name: Annotated[str, Field(description="The room's name, e.g. 'Dining Room'.")],
+    icon: Annotated[str | None, Field(description="Icon name shown in the app (home, bed, bath, utensils, car, ...). Optional.")] = None,
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Add a new room to the house, like "add a dining room". If a room with (nearly) the same
+    name already exists, nothing is created and that room is returned flagged as a duplicate."""
+
+    def go():
+        with get_conn() as conn:
+            existing = core.find_similar_room(conn, name)
+            if existing:
+                return {
+                    "created": False,
+                    "duplicate": True,
+                    "room": _room_brief(dict(existing)),
+                    "message": f"There's already a room called {existing['name']}; nothing was added.",
+                }
+        room = core.create_room(core.RoomIn(name=name, icon=icon or "home"), Response())
+        return {"created": True, "duplicate": False, "room": _room_brief(room), "message": f"Added the room {room['name']}."}
+
+    return _idempotent(idempotency_key, "add_room", lambda: _run(go))
+
+
+def rename_room(
+    room: Id,
+    new_name: Annotated[str, Field(description="The new name.")],
+) -> dict:
+    """Rename a room, like "rename the little boys room to the nursery". Keeps the same room and
+    all its task history; NFC tags written with the old address keep working."""
+
+    def go():
+        with get_conn() as conn:
+            r = _resolve_room(conn, room)
+        updated = core.update_room(r["id"], core.RoomPatch(name=new_name))
+        return {
+            "renamed": True,
+            "room": _room_brief(updated),
+            "old_name": r["name"],
+            "old_slug": r["slug"],
+            "message": f"Renamed {r['name']} to {updated['name']}. Tags pointing at /r/{r['slug']} still work.",
+        }
+
+    return _run(go)
+
+
+def archive_room(room: Id) -> dict:
+    """Retire a room, like "we don't use the guest room anymore". It disappears from the room
+    list and from what's due, but its tasks and history are kept."""
+
+    def go():
+        with get_conn() as conn:
+            r = _resolve_room(conn, room)
+        updated = core.update_room(r["id"], core.RoomPatch(active=False))
+        return {"archived": True, "room": _room_brief(updated), "message": f"Archived {updated['name']}; its history is kept."}
+
+    return _run(go)
+
+
 def list_tasks(
     room: Annotated[str | None, Field(description="Only this room (name or id). Leave empty for every room.")] = None,
     status: Annotated[
@@ -298,9 +402,11 @@ def list_tasks(
         Field(description="Filter: 'due' (due or overdue), 'overdue', or 'ok' (not due yet). Empty for all."),
     ] = None,
     due_before: Annotated[str | None, Field(description="Only tasks due on or before this date, YYYY-MM-DD.")] = None,
+    assignee: Annotated[str | None, Field(description="Only tasks on this person's list (first name, e.g. 'Susan').")] = None,
 ) -> dict | list[dict]:
-    """The recurring cleaning and maintenance tasks in the rooms, with when each is next due and
-    who did it last. Filter by room, by status, or by a due date."""
+    """The cleaning, maintenance and errand tasks, with when each is next due, who it's assigned
+    to and who did it last. Filter by room, by status, by a due date, or by the person it's
+    assigned to."""
 
     def go():
         with get_conn() as conn:
@@ -308,6 +414,9 @@ def list_tasks(
             if room:
                 r = _resolve_room(conn, room)
                 tasks = [t for t in tasks if t["room_id"] == r["id"]]
+            if assignee:
+                p = _resolve_person(conn, assignee)
+                tasks = [t for t in tasks if t["assignee_id"] == p["id"]]
         if status:
             s = status.lower()
             if s == "due":
@@ -324,39 +433,56 @@ def list_tasks(
     return _run(go)
 
 
+def _create_task(conn, title: str, room: str | None, due_on: str | None, recurrence: str | None, notes: str | None, assignee: str | None) -> dict:
+    freq = _parse_recurrence(recurrence)
+    first_due = _parse_date(due_on, "due_on")
+    r = _resolve_room(conn, room) if room else None
+    p = _resolve_person(conn, assignee) if assignee else None
+    t = core.create_task(
+        core.TaskIn(
+            room_id=r["id"] if r else None,
+            title=title,
+            description=notes or "",
+            frequency_days=freq,
+            assignee_id=p["id"] if p else None,
+            due_on=first_due if not freq else None,
+        ),
+        actor=_ACTOR,
+    )
+    if first_due and freq:
+        # a recurring task is due `frequency_days` after its last completion, so backdate one
+        anchor = datetime.combine(first_due - timedelta(days=freq), datetime.min.time(), tzinfo=timezone.utc)
+        conn.execute(
+            "INSERT INTO completions (task_id, completed_by, completed_at) VALUES (?, ?, ?)",
+            (t["id"], "(scheduled)", anchor.isoformat(timespec="seconds")),
+        )
+    return next(x for x in _all_tasks(conn) if x["id"] == t["id"])
+
+
 def add_task(
     title: Annotated[str, Field(description="What needs doing, e.g. 'Wipe down the baseboards'.")],
-    room: Id,
-    due_on: Annotated[str | None, Field(description="When it should first be due, YYYY-MM-DD. Needs a recurrence.")] = None,
+    room: Annotated[str | None, Field(description="Which room (name or id). Leave empty for an errand that isn't about a room.")] = None,
+    due_on: Annotated[str | None, Field(description="When it's due, YYYY-MM-DD (or today/tomorrow). For a recurring task, when it's first due.")] = None,
     recurrence: Annotated[
         str | None,
         Field(description="How often it repeats: daily, weekly, every 2 weeks, monthly, every 3 months, yearly, or a number of days. Empty = one-off."),
     ] = None,
     notes: Annotated[str | None, Field(description="Extra detail or instructions.")] = None,
+    assignee: Annotated[str | None, Field(description="Whose list it goes on (first name, e.g. 'Susan'). Empty = nobody in particular.")] = None,
     idempotency_key: IdemKey = None,
 ) -> dict:
-    """Add a new task to a room, like "add 'clean the ceiling fan' to the girls room, monthly"."""
+    """Add a new task, like "add 'clean the ceiling fan' to the girls room, monthly" or "Vanessa
+    should return the library books by Friday". Assigning it to someone puts it on their list and
+    notifies them."""
 
     def go():
-        freq = _parse_recurrence(recurrence)
-        first_due = _parse_date(due_on, "due_on")
+        if not room and not assignee:
+            raise ToolError("Give a room for the task, or a person to assign it to (or both).")
         with get_conn() as conn:
-            r = _resolve_room(conn, room)
-            t = core.create_task(core.TaskIn(room_id=r["id"], title=title, description=notes or "", frequency_days=freq))
-            note = None
-            if first_due and freq:
-                # a recurring task is due `frequency_days` after its last completion, so backdate one
-                anchor = datetime.combine(first_due - timedelta(days=freq), datetime.min.time(), tzinfo=timezone.utc)
-                conn.execute(
-                    "INSERT INTO completions (task_id, completed_by, completed_at) VALUES (?, ?, ?)",
-                    (t["id"], "(scheduled)", anchor.isoformat(timespec="seconds")),
-                )
-            elif first_due:
-                note = "due_on was ignored because one-off tasks have no due date; give a recurrence to schedule it."
-            task = next(x for x in _all_tasks(conn) if x["id"] == t["id"])
+            task = _create_task(conn, title, room, due_on, recurrence, notes, assignee)
         out = {"created": True, "task": _task_brief(task)}
-        if note:
-            out["note"] = note
+        if task["assignee"]:
+            out["message"] = f"Added '{task['title']}' to {task['assignee']}'s list and let them know."
         return out
 
     return _idempotent(idempotency_key, "add_task", lambda: _run(go))
@@ -374,7 +500,7 @@ def complete_task(
     def go():
         with get_conn() as conn:
             t = _resolve_task(conn, task)
-            core.complete_task(t["id"], core.CompleteIn(completed_by=(done_by or DEFAULT_ACTOR).strip() or DEFAULT_ACTOR))
+            core.complete_task(t["id"], core.CompleteIn(completed_by=(done_by or DEFAULT_ACTOR).strip() or DEFAULT_ACTOR), actor=_ACTOR)
             if note:
                 needs = bool(re.search(r"\b(buy|need|out of|order|purchase|pick up|more)\b", note.lower()))
                 core.add_note(t["id"], core.NoteIn(author=(done_by or DEFAULT_ACTOR), body=note, needs_purchase=needs))
@@ -420,7 +546,7 @@ def log_upkeep_done(
         with get_conn() as conn:
             i = _resolve_upkeep(conn, item)
             fresh = core.log_upkeep(
-                i["id"], core.UpkeepLogIn(done_on=when, done_by=(done_by or DEFAULT_ACTOR), note=note or "")
+                i["id"], core.UpkeepLogIn(done_on=when, done_by=(done_by or DEFAULT_ACTOR), note=note or ""), actor=_ACTOR
             )
         return {"logged": True, "item": fresh}
 
@@ -549,13 +675,29 @@ def remove_pantry_item(item: Id, idempotency_key: IdemKey = None) -> dict:
     return _idempotent(idempotency_key, "remove_pantry_item", lambda: _run(go))
 
 
+def _shopping_brief(s: dict) -> dict:
+    return {
+        "id": s["id"],
+        "item": s["name"],
+        "notes": s["notes"],
+        "assignee": s["assignee"],
+        "due_on": s["due_on"],
+        "overdue": s["overdue"],
+        "done": s["done"],
+        "added_by": s["added_by"],
+        "created_at": s["created_at"],
+    }
+
+
 def list_shopping() -> dict:
-    """The shopping list: things flagged as needing to be bought for a task, plus pantry items
-    that are low or below par."""
+    """The shopping list: things people were asked to buy (with who it's assigned to), things
+    flagged as needed for a task, plus pantry items that are low or below par."""
     notes = core.shopping_list()
+    items = core.list_shopping_items()
     with get_conn() as conn:
         low = [_pantry_brief(p) for p in _all_pantry(conn) if p["low"]]
     return {
+        "items": [_shopping_brief(s) for s in items],
         "to_buy_for_tasks": [
             {"note_id": n["id"], "item": n["body"], "task": n["task_title"], "room": n["room_name"], "added_by": n["author"]}
             for n in notes
@@ -592,6 +734,85 @@ def add_to_shopping(
     return _idempotent(idempotency_key, "add_to_shopping", lambda: _run(go))
 
 
+_BUY_WORDS = re.compile(
+    r"\b(buy|get|grab|pick up|purchase|order|shop for|restock|more|groceries|from (the )?(store|pharmacy|costco|target|walmart))\b"
+)
+
+
+def _infer_kind(item: str, room: str | None) -> str:
+    if room:
+        return "task"
+    return "shopping" if _BUY_WORDS.search(item.lower()) else "task"
+
+
+def add_to_list(
+    person: Annotated[str, Field(description="Whose list: a first name like 'Susan' or 'Magnus'.")],
+    item: Annotated[str, Field(description="The thing to do or buy, e.g. 'Return the library books' or 'Buy dish soap'.")],
+    kind: Annotated[str | None, Field(description="'task' (something to do) or 'shopping' (something to buy). Leave empty and it's inferred from the wording.")] = None,
+    room: Annotated[str | None, Field(description="For a task: the room it's about, if any (name or id).")] = None,
+    due_on: Annotated[str | None, Field(description="When it's needed by, YYYY-MM-DD or today/tomorrow.")] = None,
+    notes: Annotated[str | None, Field(description="Any extra detail.")] = None,
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Put something on a specific person's list, like "add 'pick up the dry cleaning' to Susan's
+    list" or "Vanessa needs to buy diapers". A thing to buy goes on their shopping list, a thing
+    to do becomes a task; they get a notification. If the name isn't one of the household's
+    people, this returns who they are instead of guessing."""
+
+    def go():
+        k = (kind or "").strip().lower() or _infer_kind(item, room)
+        if k not in ("task", "shopping"):
+            raise ToolError(f"kind should be 'task' or 'shopping', not '{kind}'.")
+        with get_conn() as conn:
+            p = _resolve_person(conn, person)
+            if k == "task":
+                task = _create_task(conn, item, room, due_on, None, notes, p["name"])
+                return {
+                    "created": True,
+                    "kind": "task",
+                    "assigned_to": p["name"],
+                    "task": _task_brief(task),
+                    "message": f"Added the task '{task['title']}' to {p['name']}'s list and notified them.",
+                }
+            s = core.create_shopping_item(
+                core.ShoppingItemIn(name=item, notes=notes or "", assignee_id=p["id"], due_on=_parse_date(due_on, "due_on")),
+                actor=_ACTOR,
+            )
+            return {
+                "created": True,
+                "kind": "shopping",
+                "assigned_to": p["name"],
+                "shopping_item": _shopping_brief(s),
+                "message": f"Added '{s['name']}' to {p['name']}'s shopping list and notified them.",
+            }
+
+    return _idempotent(idempotency_key, "add_to_list", lambda: _run(go))
+
+
+def list_for_person(
+    person: Annotated[str, Field(description="Whose list: a first name like 'Susan'.")],
+    include_done: Annotated[bool, Field(description="Also show things already finished or bought.")] = False,
+) -> dict:
+    """What's on one person's list - their assigned tasks and things to buy together, oldest
+    first, with anything overdue flagged. Like "what does Vanessa have to do?"."""
+
+    def go():
+        with get_conn() as conn:
+            p = _resolve_person(conn, person)
+            user = core.auth.get_user(conn, p["id"])
+            lst = core.person_list(conn, user, include_done)
+        n = len(lst["items"])
+        return {
+            "person": p["name"],
+            "items": lst["items"],
+            "overdue_count": lst["overdue_count"],
+            "message": f"{p['name']} has {n} thing{'s' if n != 1 else ''} on their list"
+            + (f", {lst['overdue_count']} overdue." if lst["overdue_count"] else "."),
+        }
+
+    return _run(go)
+
+
 def find(query: Annotated[str, Field(description="A word or two, e.g. 'filter', 'rice', 'bathroom'.")]) -> dict:
     """Search everything at once - rooms, tasks, upkeep jobs, pantry items and the shopping list -
     for a name. Use it when you're not sure what something is called or where it lives."""
@@ -600,18 +821,19 @@ def find(query: Annotated[str, Field(description="A word or two, e.g. 'filter', 
         tasks = [
             _task_brief(t)
             for t in _all_tasks(conn)
-            if similarity(query, t["title"]) >= 0.55 or similarity(query, f"{t['title']} {t['room_name']}") >= 0.55
+            if similarity(query, t["title"]) >= 0.55 or similarity(query, f"{t['title']} {_task_room_label(t)}") >= 0.55
         ]
         upkeep = [i for i in _all_upkeep(conn) if similarity(query, i["name"]) >= 0.55 or similarity(query, i["category"]) >= 0.72]
         pantry = [_pantry_brief(p) for p in _all_pantry(conn) if similarity(query, p["name"]) >= 0.55]
     shopping = [n for n in core.shopping_list() if similarity(query, n["body"]) >= 0.55]
-    total = len(rooms) + len(tasks) + len(upkeep) + len(pantry) + len(shopping)
+    shopping_items = [_shopping_brief(s) for s in core.list_shopping_items() if similarity(query, s["name"]) >= 0.55]
+    total = len(rooms) + len(tasks) + len(upkeep) + len(pantry) + len(shopping) + len(shopping_items)
     return {
         "query": query,
         "rooms": rooms,
         "tasks": tasks,
         "upkeep": upkeep,
         "pantry": pantry,
-        "shopping": [{"item": n["body"], "task": n["task_title"], "room": n["room_name"]} for n in shopping],
+        "shopping": [{"item": n["body"], "task": n["task_title"], "room": n["room_name"]} for n in shopping] + shopping_items,
         "message": f"Found {total} thing{'s' if total != 1 else ''} matching '{query}'." if total else f"Nothing matches '{query}'.",
     }
