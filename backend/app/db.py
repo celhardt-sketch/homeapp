@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS declutter_spots (
     done_on TEXT,
     done_by TEXT NOT NULL DEFAULT '',
     user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
     created_by TEXT NOT NULL DEFAULT ''
 );
@@ -173,7 +174,8 @@ CREATE TABLE IF NOT EXISTS upkeep_items (
     category TEXT NOT NULL DEFAULT '',
     interval_days INTEGER NOT NULL DEFAULT 90,
     notes TEXT NOT NULL DEFAULT '',
-    active INTEGER NOT NULL DEFAULT 1
+    active INTEGER NOT NULL DEFAULT 1,
+    assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS upkeep_logs (
@@ -204,7 +206,7 @@ CREATE TABLE IF NOT EXISTS shopping_items (
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL,                 -- 'task' | 'shopping'
+    kind TEXT NOT NULL,                 -- 'task' | 'shopping' | 'upkeep' | 'refill' | 'declutter'
     ref_id INTEGER NOT NULL,
     message TEXT NOT NULL,
     created_by TEXT NOT NULL DEFAULT '',
@@ -320,6 +322,9 @@ def init_db() -> None:
         for table in ("completions", "upkeep_logs"):
             if "user_id" not in _cols(conn, table):
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL")
+        for table in ("upkeep_items", "declutter_spots"):
+            if "assignee_id" not in _cols(conn, table):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL")
         _migrate_medications_to_prescriptions(conn)
         _remove_duplicate_rooms(conn)
 

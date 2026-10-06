@@ -69,6 +69,7 @@ def build_mcp() -> FastMCP:
             add_to_shopping,
             add_to_list,
             list_for_person,
+            hand_off,
             list_children,
             get_child,
             set_size,
@@ -1450,6 +1451,48 @@ def add_to_list(
             }
 
     return _idempotent(idempotency_key, "add_to_list", lambda: _run(go))
+
+
+def hand_off(
+    person: Annotated[str, Field(description="Who should do it: a first name like 'Susan' or 'Vanessa'.")],
+    kind: Annotated[str, Field(description="What sort of thing: task (a room job), upkeep (home maintenance), refill (a prescription), or declutter.")],
+    items: Annotated[list[str], Field(description="The things to hand over, by name or id. For refills give the child's name (plus the medication if they have several).")],
+    idempotency_key: IdemKey = None,
+) -> dict:
+    """Hand something that's due to a specific person so it moves from Courtney's and Magnus's
+    automatic list onto theirs: "give the furnace filter to Susan", "have Vanessa do the hall closet",
+    "hand Ava's refill to Susan". They get a notification. Several things at once is fine."""
+
+    def go():
+        k = (kind or "").strip().lower().rstrip("s")
+        k = {"room task": "task", "upkeep item": "upkeep", "home maintenance": "upkeep", "prescription": "refill", "declutter spot": "declutter"}.get(k, k)
+        if k not in core.HANDOFF_KINDS:
+            raise ToolError(f"I can hand off one of: {', '.join(core.HANDOFF_KINDS)}. Not '{kind}'.")
+        if not items:
+            raise ToolError("Tell me what to hand off - at least one name or id.")
+        with get_conn() as conn:
+            p = _resolve_person(conn, person)
+            refs = []
+            for item in items:
+                if k == "task":
+                    target = _resolve_task(conn, item)
+                elif k == "upkeep":
+                    target = _resolve_upkeep(conn, item)
+                elif k == "declutter":
+                    target = _resolve_declutter(conn, item)
+                else:
+                    child, _, rx = item.partition("/")
+                    target = _resolve_prescription(conn, child.strip(), rx.strip() or None)
+                refs.append(core.HandoffRef(kind=k, id=target["id"]))
+            moved = core.hand_off(conn, _ACTOR, refs, p["id"])
+        names = ", ".join(m["title"] for m in moved)
+        return {
+            "handed_to": p["name"],
+            "items": moved,
+            "message": f"Handed to {p['name']} and notified them: {names}.",
+        }
+
+    return _idempotent(idempotency_key, "hand_off", lambda: _run(go))
 
 
 def list_for_person(

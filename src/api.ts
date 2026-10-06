@@ -80,11 +80,16 @@ export interface ShoppingItem {
   overdue: boolean
 }
 
+export type ListKind = 'task' | 'shopping' | 'upkeep' | 'refill' | 'declutter'
+export type HandoffKind = Exclude<ListKind, 'shopping'>
+
 export interface ListItem {
-  kind: 'task' | 'shopping'
+  kind: ListKind
   id: number
   title: string
   notes: string
+  detail: string | null
+  auto: boolean
   room_name: string | null
   room_slug: string | null
   due_on: string | null
@@ -106,7 +111,7 @@ export interface PersonList {
 export interface Notification {
   id: number
   user_id: number
-  kind: 'task' | 'shopping'
+  kind: ListKind
   ref_id: number
   message: string
   created_by: string
@@ -342,6 +347,11 @@ export const api = {
   myList: (includeDone = false) => request<PersonList>(`/api/me/list${includeDone ? '?include_done=true' : ''}`),
   userList: (id: number, includeDone = false) =>
     request<PersonList>(`/api/users/${id}/list${includeDone ? '?include_done=true' : ''}`),
+  handOff: (items: { kind: HandoffKind; id: number }[], assigneeId: number | null) =>
+    request<{ assignee: string | null; items: ListItem[] }>('/api/list/handoff', {
+      method: 'POST',
+      body: JSON.stringify({ items, assignee_id: assigneeId }),
+    }),
   notifications: () => request<Notification[]>('/api/me/notifications?limit=20'),
   markNotificationsRead: () => request<{ marked: number }>('/api/me/notifications/read', { method: 'POST' }),
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
-import { Check, Plus, ShoppingCart, Trash2 } from 'lucide-react'
+import { Check, Pill, Plus, ShoppingCart, Sparkles, Trash2, Wrench } from 'lucide-react'
 import { api, formatDay, formatFrequency, type ListItem, type PersonList, type User } from '../api'
 
 export default function MyListPage({ me }: { me: User }) {
@@ -27,11 +27,27 @@ export default function MyListPage({ me }: { me: User }) {
     api.users().then(setUsers).catch(() => setUsers([]))
   }, [])
 
+  const today = () => new Date().toISOString().slice(0, 10)
+
   async function finish(item: ListItem) {
     setError(null)
     try {
       if (item.kind === 'task') await api.completeTask(item.id)
-      else await api.updateShoppingItem(item.id, { bought: true })
+      else if (item.kind === 'shopping') await api.updateShoppingItem(item.id, { bought: true })
+      else if (item.kind === 'upkeep') await api.logUpkeep(item.id, { done_on: today(), done_by: me.name })
+      else if (item.kind === 'refill') await api.logPickup(item.id, { picked_up_on: today() })
+      else await api.updateDeclutter(item.id, { done: true })
+      load()
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
+  async function handTo(item: ListItem, user: User | null) {
+    if (item.kind === 'shopping') return
+    setError(null)
+    try {
+      await api.handOff([{ kind: item.kind, id: item.id }], user ? user.id : null)
       load()
     } catch (e) {
       setError((e as Error).message)
@@ -77,6 +93,7 @@ export default function MyListPage({ me }: { me: User }) {
         <h1 className="text-xl font-semibold">{mine ? 'My list' : `${person.name}'s list`}</h1>
         <p className="text-sm text-stone-500">
           {mine ? 'Tasks and things to buy that are yours' : `What ${person.name} has been asked to do`}, oldest first.
+          {list?.user.role === 'admin' && ' Anything due around the house that nobody has been handed shows up here too.'}
         </p>
       </div>
 
@@ -157,9 +174,9 @@ export default function MyListPage({ me }: { me: User }) {
               >
                 <button
                   onClick={() => finish(item)}
-                  disabled={item.done || !mine}
-                  aria-label={item.kind === 'task' ? `Mark "${item.title}" done` : `Mark "${item.title}" bought`}
-                  title={mine ? undefined : 'Only the person it belongs to can check this off'}
+                  disabled={item.done || (!mine && !item.auto)}
+                  aria-label={item.kind === 'shopping' ? `Mark "${item.title}" bought` : `Mark "${item.title}" done`}
+                  title={mine || item.auto ? undefined : 'Only the person it belongs to can check this off'}
                   className={`mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full border-2 ${
                     item.done
                       ? 'border-emerald-500 bg-emerald-500 text-white'
@@ -171,11 +188,22 @@ export default function MyListPage({ me }: { me: User }) {
                 <div className="flex-1">
                   <p className={`flex items-center gap-1.5 ${item.done ? 'line-through' : ''}`}>
                     {item.kind === 'shopping' && <ShoppingCart className="size-4 text-stone-400" />}
+                    {item.kind === 'upkeep' && <Wrench className="size-4 text-stone-400" />}
+                    {item.kind === 'refill' && <Pill className="size-4 text-stone-400" />}
+                    {item.kind === 'declutter' && <Sparkles className="size-4 text-stone-400" />}
                     {item.title}
+                    {item.auto && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">Due</span>}
                   </p>
                   <p className="mt-1 text-xs text-stone-500">
-                    {item.kind === 'shopping' ? 'To buy' : item.room_slug ? <Link to={`/r/${item.room_slug}`} className="text-teal-700 underline">{item.room_name}</Link> : 'Errand'}
-                    {item.kind === 'task' && item.frequency_days && <> · {formatFrequency(item.frequency_days)}</>}
+                    {item.detail
+                      ? item.detail
+                      : item.kind === 'shopping'
+                        ? 'To buy'
+                        : item.room_slug
+                          ? <Link to={`/r/${item.room_slug}`} className="text-teal-700 underline">{item.room_name}</Link>
+                          : 'Errand'}
+                    {item.detail && item.room_name && <> · {item.room_name}</>}
+                    {item.frequency_days && <> · {formatFrequency(item.frequency_days)}</>}
                     {item.due_on && (
                       <>
                         {' '}
@@ -187,8 +215,30 @@ export default function MyListPage({ me }: { me: User }) {
                     {item.notes && <> · {item.notes}</>}
                     {item.done && item.last_completed_by && <> · done by {item.last_completed_by}</>}
                   </p>
+                  {item.kind !== 'shopping' && !item.done && me.role === 'admin' && (
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs">
+                      <span className="text-stone-400">Hand to</span>
+                      {users
+                        .filter((u) => u.id !== person.id)
+                        .map((u) => (
+                          <button
+                            key={u.id}
+                            type="button"
+                            onClick={() => handTo(item, u)}
+                            className="rounded-full bg-stone-100 px-2.5 py-1 text-stone-700 hover:bg-teal-700 hover:text-white"
+                          >
+                            {u.name}
+                          </button>
+                        ))}
+                      {!item.auto && (
+                        <button type="button" onClick={() => handTo(item, null)} className="rounded-full px-2.5 py-1 text-stone-500 underline">
+                          Take back
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
-                {(mine || me.role === 'admin') && (
+                {(item.kind === 'task' || item.kind === 'shopping') && !item.auto && (mine || me.role === 'admin') && (
                   <button onClick={() => remove(item)} className="p-1.5 text-stone-400 hover:text-red-600" aria-label={`Delete "${item.title}"`}>
                     <Trash2 className="size-4" />
                   </button>
