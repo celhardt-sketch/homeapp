@@ -588,7 +588,13 @@ def notify_assignment(conn: sqlite3.Connection, actor: Actor, assignee_id: int |
     if assignee_id is None or assignee_id == actor.user_id:
         return
     by = actor.attribution("Someone")
-    noun = "a task" if kind == "task" else "something to buy"
+    noun = {
+        "task": "a task",
+        "shopping": "something to buy",
+        "upkeep": "a home maintenance job",
+        "refill": "a prescription refill",
+        "declutter": "a spot to declutter",
+    }.get(kind, "something")
     conn.execute(
         "INSERT INTO notifications (user_id, kind, ref_id, message, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (assignee_id, kind, ref_id, f"{by} put {noun} on your list: {what}", by, now_iso()),
@@ -1006,59 +1012,233 @@ def delete_shopping_item(item_id: int):
 # ---------- Per-person lists & notifications ----------
 
 
+HANDOFF_KINDS = ("task", "upkeep", "refill", "declutter")
+
+
+def _list_entry(kind: str, id_: int, title: str, **extra) -> dict:
+    base = {
+        "kind": kind,
+        "id": id_,
+        "title": title,
+        "notes": "",
+        "detail": None,
+        "room_name": None,
+        "room_slug": None,
+        "due_on": None,
+        "frequency_days": None,
+        "status": "ok",
+        "overdue": False,
+        "done": False,
+        "auto": False,
+        "created_at": "",
+        "last_completed_at": None,
+        "last_completed_by": None,
+    }
+    base.update(extra)
+    return base
+
+
+def _task_entry(t: dict, auto: bool = False) -> dict:
+    return _list_entry(
+        "task",
+        t["id"],
+        t["title"],
+        notes=t["description"],
+        room_name=t["room_name"],
+        room_slug=t["room_slug"],
+        due_on=t["due_on"],
+        frequency_days=t["frequency_days"],
+        status=t["status"],
+        overdue=t["status"] == "overdue",
+        done=t["done"],
+        auto=auto,
+        created_at=t["created_at"],
+        last_completed_at=t["last_completed_at"],
+        last_completed_by=t["last_completed_by"],
+    )
+
+
+def _upkeep_entry(u: dict, auto: bool = False) -> dict:
+    return _list_entry(
+        "upkeep",
+        u["id"],
+        u["name"],
+        notes=u["notes"],
+        detail=f"Home maintenance{' · ' + u['category'] if u['category'] else ''}",
+        due_on=u["due_on"],
+        frequency_days=u["interval_days"],
+        status=u["status"],
+        overdue=u["days_left"] < 0,
+        auto=auto,
+        created_at=u["due_on"],
+        last_completed_at=u["last_done_on"],
+        last_completed_by=u["last_done_by"],
+    )
+
+
+def _refill_entry(p: dict, auto: bool = False) -> dict:
+    left = p["days_of_supply_left"]
+    if p["refill_status"] == "urgent":
+        supply = "supply is out" if left is not None and left <= 0 else f"{left} day{'s' if left != 1 else ''} of supply left"
+    elif p["refill_status"] == "called_waiting":
+        supply = f"called {p['called_on']}, waiting"
+    else:
+        supply = f"{left} day{'s' if left != 1 else ''} of supply left"
+    who = p["contact_name"] or p["pharmacy"]
+    return _list_entry(
+        "refill",
+        p["id"],
+        f"Refill {p['name']} for {p['child']}",
+        child=p["child"],
+        notes=p["notes"],
+        detail=f"Prescription refill · {supply}" + (f" · call {who}" if who else ""),
+        status="overdue" if p["refill_status"] == "urgent" else "due",
+        overdue=p["refill_status"] == "urgent",
+        auto=auto,
+        created_at=p["last_picked_up_on"] or "",
+        last_completed_at=p["last_picked_up_on"],
+        last_completed_by=p["last_picked_up_by"],
+    )
+
+
+def _declutter_entry(d: dict, auto: bool = False) -> dict:
+    return _list_entry(
+        "declutter",
+        d["id"],
+        d["name"],
+        notes=d["notes"],
+        detail="Declutter",
+        room_name=d["room"],
+        status="due",
+        done=d["done"],
+        auto=auto,
+        created_at=d["created_at"],
+        last_completed_at=d["done_on"],
+        last_completed_by=d["done_by"],
+    )
+
+
+def _shopping_entry(s: dict) -> dict:
+    return _list_entry(
+        "shopping",
+        s["id"],
+        s["name"],
+        notes=s["notes"],
+        due_on=s["due_on"],
+        status="overdue" if s["overdue"] else "ok",
+        overdue=s["overdue"],
+        done=s["done"],
+        created_at=s["created_at"],
+        last_completed_at=s["bought_at"],
+        last_completed_by=s["bought_by"] or None,
+    )
+
+
+def unassigned_due_items(conn: sqlite3.Connection) -> list[dict]:
+    """What lands on every admin's list automatically: due home maintenance, due refills, room tasks
+    that are due, and open declutter spots - each only while nobody has been handed it. They stay
+    until done or handed off; nothing is copied, so there is never a duplicate to clean up."""
+    items = []
+    for row in conn.execute("SELECT * FROM upkeep_items WHERE active = 1 AND assignee_id IS NULL"):
+        u = serialize_upkeep(conn, row)
+        if u["status"] == "due":
+            items.append(_upkeep_entry(u, auto=True))
+    for p in refills.due_refills(conn):
+        if p["assignee_id"] is None:
+            items.append(_refill_entry(p, auto=True))
+    for row in conn.execute(
+        "SELECT t.* FROM tasks t JOIN rooms r ON r.id = t.room_id WHERE t.active = 1 AND r.active = 1 AND t.assignee_id IS NULL"
+    ):
+        t = serialize_task(conn, row)
+        if t["status"] in ("due", "overdue"):
+            items.append(_task_entry(t, auto=True))
+    for row in conn.execute("SELECT * FROM declutter_spots WHERE done_on IS NULL AND assignee_id IS NULL"):
+        items.append(_declutter_entry(serialize_declutter(conn, row), auto=True))
+    return items
+
+
 def person_list(conn: sqlite3.Connection, user: sqlite3.Row, include_done: bool = False) -> dict:
-    """Everything assigned to one person - tasks and shopping together - oldest first."""
+    """Everything on one person's list, oldest first: their assigned tasks and shopping, plus home
+    maintenance, refills and declutter spots handed to them. Admins also see everything due that
+    nobody has been handed yet (`auto: true`)."""
     items = []
     for row in conn.execute("SELECT * FROM tasks WHERE assignee_id = ? AND active = 1", (user["id"],)):
         t = serialize_task(conn, row)
         if t["done"] and not include_done:
             continue
-        items.append(
-            {
-                "kind": "task",
-                "id": t["id"],
-                "title": t["title"],
-                "notes": t["description"],
-                "room_name": t["room_name"],
-                "room_slug": t["room_slug"],
-                "due_on": t["due_on"],
-                "frequency_days": t["frequency_days"],
-                "status": t["status"],
-                "overdue": t["status"] == "overdue",
-                "done": t["done"],
-                "created_at": t["created_at"],
-                "last_completed_at": t["last_completed_at"],
-                "last_completed_by": t["last_completed_by"],
-            }
-        )
+        items.append(_task_entry(t))
     for row in conn.execute("SELECT * FROM shopping_items WHERE assignee_id = ?", (user["id"],)):
         s = serialize_shopping_item(conn, row)
         if s["done"] and not include_done:
             continue
-        items.append(
-            {
-                "kind": "shopping",
-                "id": s["id"],
-                "title": s["name"],
-                "notes": s["notes"],
-                "room_name": None,
-                "room_slug": None,
-                "due_on": s["due_on"],
-                "frequency_days": None,
-                "status": "overdue" if s["overdue"] else "ok",
-                "overdue": s["overdue"],
-                "done": s["done"],
-                "created_at": s["created_at"],
-                "last_completed_at": s["bought_at"],
-                "last_completed_by": s["bought_by"] or None,
-            }
-        )
+        items.append(_shopping_entry(s))
+    for row in conn.execute("SELECT * FROM upkeep_items WHERE active = 1 AND assignee_id = ?", (user["id"],)):
+        items.append(_upkeep_entry(serialize_upkeep(conn, row)))
+    for p in refills.active_prescriptions(conn):
+        if p["assignee_id"] == user["id"] and p["refill_status"] in (*refills.DUE_STATUSES, "called_waiting"):
+            items.append(_refill_entry(p))
+    for row in conn.execute("SELECT * FROM declutter_spots WHERE done_on IS NULL AND assignee_id = ?", (user["id"],)):
+        items.append(_declutter_entry(serialize_declutter(conn, row)))
+    if user["role"] == auth.ADMIN:
+        items.extend(unassigned_due_items(conn))
     items.sort(key=lambda i: (i["created_at"], i["kind"], i["id"]))
     return {
         "user": auth.public_user(user),
         "items": items,
         "overdue_count": sum(1 for i in items if i["overdue"] and not i["done"]),
     }
+
+
+class HandoffRef(BaseModel):
+    kind: Literal["task", "upkeep", "refill", "declutter"]
+    id: int
+
+
+class HandoffIn(BaseModel):
+    items: list[HandoffRef] = Field(min_length=1)
+    assignee_id: int | None
+
+
+def hand_off(conn: sqlite3.Connection, actor: Actor, refs: list[HandoffRef], assignee_id: int | None) -> list[dict]:
+    """Move due items onto one person's list. `assignee_id` None puts an item back on the admins'
+    automatic list. One notification per item for the person receiving it."""
+    table = {"task": "tasks", "upkeep": "upkeep_items", "refill": "prescriptions", "declutter": "declutter_spots"}
+    fetch = {
+        "task": fetch_task_or_404,
+        "upkeep": fetch_upkeep_or_404,
+        "refill": fetch_prescription_or_404,
+        "declutter": fetch_declutter_or_404,
+    }
+    out = []
+    for ref in refs:
+        row = fetch[ref.kind](conn, ref.id)
+        check_assignment(conn, actor, assignee_id, row["assignee_id"])
+        conn.execute(f"UPDATE {table[ref.kind]} SET assignee_id = ? WHERE id = ?", (assignee_id, ref.id))
+        row = fetch[ref.kind](conn, ref.id)
+        if ref.kind == "task":
+            entry = _task_entry(serialize_task(conn, row))
+        elif ref.kind == "upkeep":
+            entry = _upkeep_entry(serialize_upkeep(conn, row))
+        elif ref.kind == "refill":
+            entry = _refill_entry(refills.serialize_prescription(conn, row))
+        else:
+            entry = _declutter_entry(serialize_declutter(conn, row))
+        # a refill notification never names the medication (lock-screen previews)
+        what = f"refill for {entry['child']}" if ref.kind == "refill" else entry["title"]
+        notify_assignment(conn, actor, assignee_id, ref.kind, ref.id, what)
+        out.append(entry)
+    return out
+
+
+@app.post("/api/list/handoff", dependencies=MEMBER)
+def handoff_route(body: HandoffIn, actor: Actor = ACTOR):
+    """Hand due items (task, upkeep, refill, declutter) to someone - they move to that person's list
+    and off the admins' automatic list. Admins and Claude can hand to anyone; a helper can only
+    take something for themselves."""
+    with get_conn() as conn:
+        assignee = fetch_user_or_404(conn, body.assignee_id) if body.assignee_id is not None else None
+        items = hand_off(conn, actor, body.items, body.assignee_id)
+        return {"assignee": assignee["name"] if assignee else None, "items": items}
 
 
 @app.get("/api/users/{user_id}/list", dependencies=MEMBER)
@@ -1584,6 +1764,8 @@ def serialize_upkeep(conn: sqlite3.Connection, i: sqlite3.Row) -> dict:
         "interval_days": i["interval_days"],
         "notes": i["notes"],
         "active": bool(i["active"]),
+        "assignee_id": i["assignee_id"],
+        "assignee": user_name(conn, i["assignee_id"]),
         "last_done_on": last["done_on"] if last else None,
         "last_done_by": last["done_by"] if last else None,
         "due_on": due_on,
@@ -1664,6 +1846,7 @@ def log_upkeep(item_id: int, body: UpkeepLogIn, actor: Actor = ACTOR):
             "INSERT INTO upkeep_logs (item_id, done_on, done_by, note, user_id) VALUES (?, ?, ?, ?, ?)",
             (item_id, body.done_on.isoformat(), by, body.note.strip(), actor.user_id),
         )
+        conn.execute("UPDATE upkeep_items SET assignee_id = NULL WHERE id = ?", (item_id,))
         return serialize_upkeep(conn, fetch_upkeep_or_404(conn, item_id))
 
 
@@ -1698,6 +1881,8 @@ def serialize_declutter(conn: sqlite3.Connection, s: sqlite3.Row) -> dict:
         "room_id": s["room_id"],
         "room": room["name"] if room else None,
         "notes": s["notes"],
+        "assignee_id": s["assignee_id"],
+        "assignee": user_name(conn, s["assignee_id"]),
         "done": done_on is not None,
         "done_on": done_on,
         "done_by": s["done_by"] or None,
@@ -1779,7 +1964,7 @@ def update_declutter(spot_id: int, body: DeclutterPatch, actor: Actor = ACTOR):
             if k in fields and fields[k] is not None:
                 fields[k] = " ".join(fields[k].split())
         if done is True:
-            fields.update(done_on=(done_on or date.today()).isoformat(), done_by=actor.name, user_id=actor.user_id)
+            fields.update(done_on=(done_on or date.today()).isoformat(), done_by=actor.name, user_id=actor.user_id, assignee_id=None)
         elif done is False:
             fields.update(done_on=None, done_by="", user_id=None)
         if fields:
