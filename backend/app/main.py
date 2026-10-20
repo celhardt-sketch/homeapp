@@ -9,13 +9,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from html import escape
 from pydantic import BaseModel, Field
 from typing import Literal, Union
 
-from . import auth, kids, notify, oauth, refills
+from . import auth, kids, notify, oauth, refills, shortcut
 from .db import get_conn, init_db
 from .matching import similarity
 from .seed import seed_if_empty
@@ -43,6 +43,11 @@ app = FastAPI(title="Home Maintenance", lifespan=lifespan)
 
 PUBLIC_API_PATHS = frozenset({"/api/health", "/api/login", "/api/login/names"})
 SESSION_TOKEN_HEADER = "X-Session-Token"
+SHORTCUT_PATHS = frozenset({"/api/shortcut/add"})
+SHORTCUT_BAD_KEY = (
+    "That Siri key doesn't work any more. In the home app open Manage, tap \"Make a new Siri key\" "
+    "and paste it into the Shortcut."
+)
 
 
 @app.middleware("http")
@@ -56,7 +61,12 @@ async def require_login_for_api(request: Request, call_next):
     request.state.role = None
     request.state.user = None
     is_api = path == "/api" or path.startswith("/api/")
-    if is_api and path not in PUBLIC_API_PATHS:
+    if path in SHORTCUT_PATHS:
+        user = auth.shortcut_key_user(request.headers.get("authorization"))
+        if user is None:
+            return PlainTextResponse(SHORTCUT_BAD_KEY, status_code=401)
+        request.state.role, request.state.user = auth.SHORTCUT, user
+    elif is_api and path not in PUBLIC_API_PATHS:
         try:
             request.state.role, request.state.user = auth.authenticate(request.headers.get("authorization"))
         except HTTPException as exc:
@@ -330,6 +340,7 @@ class ReminderSettingsIn(BaseModel):
 MEMBER = [Depends(auth.need_member)]  # any named user or the connector
 ADMIN = [Depends(auth.need_admin)]  # admin only -> 403 for members and the connector
 MANAGER = [Depends(auth.need_manager)]  # admin or connector -> 403 for members (room changes)
+SHORTCUT = [Depends(auth.need_shortcut)]  # a person's Siri Shortcut key, only on SHORTCUT_PATHS
 
 
 # ---------- Auth & users ----------
@@ -1095,6 +1106,106 @@ def mark_notifications_read(actor: Actor = ACTOR):
     with get_conn() as conn:
         cur = conn.execute("UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL", (now_iso(), actor.user_id))
         return {"marked": cur.rowcount}
+
+
+# ---------- Siri Shortcut ----------
+
+
+def shortcut_url() -> str:
+    return oauth.public_base_url() + "/api/shortcut/add"
+
+
+def _own_user_id(actor: Actor) -> int:
+    if actor.user_id is None:
+        raise HTTPException(403, "Claude can't have a Siri key; each person makes their own on the Manage page")
+    return actor.user_id
+
+
+@app.get("/api/me/shortcut", dependencies=MEMBER)
+def shortcut_status(actor: Actor = ACTOR):
+    status = auth.shortcut_key_status(_own_user_id(actor))
+    return {"has_key": status is not None, **(status or {"created_at": None, "last_used_at": None}), "url": shortcut_url()}
+
+
+@app.post("/api/me/shortcut", status_code=201, dependencies=MEMBER)
+def make_shortcut_key(actor: Actor = ACTOR):
+    """A new Siri key for the signed-in person; any earlier key stops working."""
+    key = auth.create_shortcut_key(_own_user_id(actor))
+    return {"key": key, "authorization": f"Bearer {key}", "url": shortcut_url()}
+
+
+@app.delete("/api/me/shortcut", dependencies=MEMBER)
+def revoke_shortcut_key(actor: Actor = ACTOR):
+    return {"revoked": auth.revoke_shortcut_key(_own_user_id(actor))}
+
+
+async def _shortcut_text(request: Request) -> str:
+    """The dictated sentence: JSON {"text": ...}, a form field `text`, or the raw body."""
+    ctype = request.headers.get("content-type", "")
+    try:
+        if "json" in ctype:
+            data = await request.json()
+            if isinstance(data, dict):
+                return str(data.get("text") or "")
+            return str(data or "")
+        if "form" in ctype:
+            return str((await request.form()).get("text") or "")
+        return (await request.body()).decode("utf-8", "replace")
+    except (ValueError, UnicodeDecodeError):
+        return ""
+
+
+def _format_due(d: date) -> str:
+    return f"{d.strftime('%A')} {d.strftime('%b')} {d.day}"
+
+
+def shortcut_add_text(user: sqlite3.Row, text: str) -> str:
+    """Add what was said to the right person's list and return the sentence to say back."""
+    actor = Actor(role=user["role"], user_id=user["id"], name=user["name"])
+    with get_conn() as conn:
+        people = conn.execute("SELECT * FROM users WHERE active = 1 ORDER BY id").fetchall()
+        try:
+            parsed = shortcut.parse(text, [p["name"] for p in people], date.today())
+        except shortcut.Reply as r:
+            return r.message
+        target = user if parsed.person == shortcut.SELF else next(p for p in people if p["name"] == parsed.person)
+        whose = "your" if target["id"] == user["id"] else f"{target['name']}'s"
+        if target["id"] != user["id"] and not actor.can_assign:
+            return (
+                f"Only an admin can put things on {target['name']}'s list. Nothing was added. "
+                "Say it without a name to add it to your own list."
+            )
+        existing = person_list(conn, target)["items"]
+
+    added, already = [], []
+    for item in parsed.items:
+        dup = next((e for e in existing if similarity(item, e["title"]) >= shortcut.CONFIDENT), None)
+        if dup:
+            already.append(dup["title"])
+            continue
+        title, extra = item[: shortcut.MAX_TITLE], item if len(item) > shortcut.MAX_TITLE else ""
+        if parsed.shopping:
+            create_shopping_item(ShoppingItemIn(name=title, notes=extra[:500], assignee_id=target["id"], due_on=parsed.due_on), actor=actor)
+        else:
+            create_task(TaskIn(title=title, description=extra, assignee_id=target["id"], due_on=parsed.due_on), actor=actor)
+        added.append(title)
+
+    parts = []
+    if added:
+        where = f"{whose} shopping list" if parsed.shopping else f"{whose} list"
+        msg = f"Added {shortcut.join_names(added)} to {where}"
+        if parsed.due_on:
+            msg += f", due {_format_due(parsed.due_on)}"
+        parts.append(msg + ".")
+    if already:
+        parts.append(f"Already on {whose} list: {shortcut.join_names(already)}.")
+    return " ".join(parts)
+
+
+@app.post("/api/shortcut/add", dependencies=SHORTCUT, response_class=PlainTextResponse)
+async def shortcut_add(request: Request):
+    """Siri Shortcut endpoint: one dictated sentence in, one sentence out (plain text, for Siri to read)."""
+    return PlainTextResponse(shortcut_add_text(request.state.user, await _shortcut_text(request)))
 
 
 # ---------- Pantry ----------
