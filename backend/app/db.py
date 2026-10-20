@@ -251,6 +251,16 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     last_used_at TEXT
 );
 
+-- One Siri Shortcut key per person (only its SHA-256 is stored). It only works on /api/shortcut/*
+-- and stops working when that person's password is changed (token_version) or they're deactivated.
+CREATE TABLE IF NOT EXISTS shortcut_keys (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    key_hash TEXT NOT NULL UNIQUE,
+    token_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key TEXT PRIMARY KEY,
     tool TEXT NOT NULL,

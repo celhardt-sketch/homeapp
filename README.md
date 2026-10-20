@@ -41,6 +41,15 @@ Standing rules for all changes (name matching, persistent reminders, duplicates,
 
 Accounts are created on first start from `HOME_USERS` (default `Courtney:admin,Magnus:admin,Susan,Vanessa`) with a password per person from `PASSWORD_<NAME>` (e.g. `PASSWORD_SUSAN`). There are no default passwords: if a listed person has no account yet and no password variable, the server refuses to start and logs which variable is missing. Upgrading from the old shared passwords: admins inherit the stored admin password and members the stored household password, so nothing needs to be set. Everyone can change their own password from the Manage page; admins can add people, reset passwords and remove people. Changing someone's password logs out their devices only.
 
+## Siri Shortcut
+
+Anyone can add to a list by voice from an iPhone: "Hey Siri, house list" → "Susan: call the plumber Friday" / "remind me to renew the registration" / "buy milk, eggs and diapers". Set-up steps are shown on the Manage page when you tap **Make my Siri key**.
+
+- Each person makes their own key on the Manage page; only its SHA-256 is stored and it's shown once. It works only on `POST /api/shortcut/add` (every other route returns 401 for it) and stops working when that person's password is changed, they're deactivated, they make a new key, or they tap **Turn off**.
+- The endpoint takes `{"text": "..."}` (or a form field `text`, or a plain-text body) and answers in plain text for Siri to read. Items are recorded as added by the key's owner; members can only add to their own list, admins to anyone's (who gets the usual notification).
+- Names follow the usual matching rules: an unknown or ambiguous name gets a question back and nothing is added. Something already on that person's list is not added twice. "today / tomorrow / Friday / next Tuesday" at the end sets a due date (server date).
+- Parsing lives in `backend/app/shortcut.py` (plain patterns). No MCP tool: Claude already has `add_to_list`, and a key is a credential that shouldn't be minted through the connector.
+
 ## Claude connector (MCP)
 
 The server exposes a remote MCP server (Streamable HTTP) at `/mcp` so Claude can read and write rooms, tasks, people's lists, upkeep, the declutter list, pantry, the shopping list, the kids' sizes and needs, and prescription refills (35 tools; the full list is `EXPECTED_TOOLS` in `backend/tests/test_mcp.py`). It runs in the same process and database as the app.

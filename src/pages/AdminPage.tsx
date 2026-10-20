@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Archive, ArchiveRestore, Bot, Copy, KeyRound, LogOut, Mail, Nfc, Pencil, Plus, Trash2, Users, X } from 'lucide-react'
+import { Archive, ArchiveRestore, Bot, Copy, KeyRound, LogOut, Mail, Mic, Nfc, Pencil, Plus, Trash2, Users, X } from 'lucide-react'
 import {
   api,
   formatDay,
@@ -8,6 +8,8 @@ import {
   setAdminToken,
   type ConnectorStatus,
   type ReminderSettings,
+  type ShortcutKey,
+  type ShortcutStatus,
   type Room,
   type RoomSummary,
   type Task,
@@ -102,6 +104,7 @@ export default function AdminPage({ session, onLogout }: { session: Session; onL
 
       {showPassword && <ChangePasswordForm onDone={() => setShowPassword(false)} />}
 
+      {!selected && session.user && <SiriShortcutCard />}
       {!selected && isAdmin && <UsersCard me={session.user} users={users} onChange={loadUsers} />}
       {!selected && isAdmin && <ReminderSettingsCard />}
       {!selected && isAdmin && <ConnectorCard />}
@@ -240,6 +243,136 @@ function ConnectorCard() {
       ) : (
         <p className="text-sm text-stone-500">Not connected yet.</p>
       )}
+      {msg && (
+        <p className={`mt-2 rounded-lg p-2 text-sm ${msg.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>{msg.text}</p>
+      )}
+    </section>
+  )
+}
+
+function CopyField({ label, value }: { label: string; value: string }) {
+  const [copied, setCopied] = useState(false)
+  function copy() {
+    navigator.clipboard.writeText(value).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    })
+  }
+  return (
+    <div className="mb-2">
+      <span className="block text-xs font-medium text-stone-600">{label}</span>
+      <div className="flex items-center gap-2">
+        <code className="flex-1 truncate rounded-lg bg-stone-100 px-2 py-1.5 text-xs">{value}</code>
+        <button onClick={copy} className="rounded-lg border border-stone-300 p-1.5 text-stone-600" aria-label={`Copy ${label}`}>
+          <Copy className="size-4" />
+        </button>
+        {copied && <span className="text-xs text-teal-700">Copied</span>}
+      </div>
+    </div>
+  )
+}
+
+function SiriShortcutCard() {
+  const [status, setStatus] = useState<ShortcutStatus | null>(null)
+  const [fresh, setFresh] = useState<ShortcutKey | null>(null)
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  const load = useCallback(() => {
+    api
+      .shortcutStatus()
+      .then(setStatus)
+      .catch((e: Error) => setMsg({ ok: false, text: e.message }))
+  }, [])
+  useEffect(load, [load])
+
+  async function make() {
+    if (status?.has_key && !confirm('Make a new Siri key? The Shortcut on your phone will stop working until you paste the new key into it.'))
+      return
+    setMsg(null)
+    try {
+      setFresh(await api.makeShortcutKey())
+      load()
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message })
+    }
+  }
+
+  async function revoke() {
+    if (!confirm('Turn off your Siri key? The Shortcut will stop adding things until you make a new key.')) return
+    setMsg(null)
+    try {
+      await api.revokeShortcutKey()
+      setFresh(null)
+      setMsg({ ok: true, text: 'Siri key turned off.' })
+      load()
+    } catch (e) {
+      setMsg({ ok: false, text: (e as Error).message })
+    }
+  }
+
+  if (!status) return null
+
+  return (
+    <section className="rounded-xl bg-white p-4 shadow-sm">
+      <h2 className="mb-1 flex items-center gap-2 font-medium">
+        <Mic className="size-5 text-teal-700" /> Siri Shortcut
+      </h2>
+      <p className="mb-2 text-sm text-stone-500">
+        Say "Hey Siri, house list", then something like "Susan: call the plumber Friday", "remind me to renew the
+        registration" or "buy milk and eggs". Things you add are recorded as added by you. The key can only add things
+        to lists, nothing else.
+      </p>
+      {status.has_key ? (
+        <p className="mb-2 flex flex-wrap items-center gap-2 text-sm">
+          <span className="rounded-full bg-green-50 px-2 py-0.5 text-xs text-green-700">Siri key is on</span>
+          <span className="text-xs text-stone-500">
+            {status.last_used_at ? `Last used ${formatDay(status.last_used_at)}` : 'Not used yet'}
+          </span>
+        </p>
+      ) : (
+        <p className="mb-2 text-sm text-stone-500">No Siri key yet.</p>
+      )}
+      {fresh && (
+        <div className="mb-3 rounded-lg border border-teal-200 bg-teal-50 p-3">
+          <p className="mb-2 text-sm font-medium text-teal-900">
+            Your new key is below. It is only shown now; if you lose it, just make a new one.
+          </p>
+          <CopyField label="URL" value={fresh.url} />
+          <CopyField label="Authorization header value" value={fresh.authorization} />
+          <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm text-stone-700">
+            <li>On your iPhone open the <b>Shortcuts</b> app and tap <b>+</b>.</li>
+            <li>Tap the name at the top, choose <b>Rename</b> and type <b>House list</b>.</li>
+            <li>
+              Tap <b>Add Action</b>, search <b>Ask for Input</b> and add it. Tap <b>Prompt</b> and type <b>What should I add?</b>
+            </li>
+            <li>
+              Search <b>Get Contents of URL</b> and add it. Tap <b>URL</b> and paste the URL above.
+            </li>
+            <li>
+              Tap the arrow next to it to show more. Set <b>Method</b> to <b>POST</b>. Under <b>Headers</b> tap <b>Add new header</b>:
+              key <b>Authorization</b>, value: paste the Authorization header value above.
+            </li>
+            <li>
+              Set <b>Request Body</b> to <b>JSON</b>, tap <b>Add new field</b> → <b>Text</b>. Key <b>text</b>, value: tap it and pick{' '}
+              <b>Provided Input</b> from the bar above the keyboard.
+            </li>
+            <li>
+              Search <b>Show Result</b> and add it (Siri reads the app's answer out loud). Tap <b>Done</b>.
+            </li>
+            <li>Try it: "Hey Siri, house list".</li>
+          </ol>
+        </div>
+      )}
+      <div className="flex flex-wrap gap-2">
+        <button onClick={make} className="rounded-lg bg-teal-700 px-3 py-1.5 text-sm text-white">
+          {status.has_key ? 'Make a new Siri key' : 'Make my Siri key'}
+        </button>
+        {status.has_key && (
+          <button onClick={revoke} className="rounded-lg border border-red-200 px-3 py-1.5 text-sm text-red-700">
+            Turn off
+          </button>
+        )}
+      </div>
       {msg && (
         <p className={`mt-2 rounded-lg p-2 text-sm ${msg.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>{msg.text}</p>
       )}

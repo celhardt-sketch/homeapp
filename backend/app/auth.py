@@ -29,6 +29,8 @@ from .db import get_conn
 ADMIN = "admin"
 MEMBER = "member"
 CONNECTOR = "connector"
+SHORTCUT = "shortcut"  # a person's Siri Shortcut key; only valid on /api/shortcut/*
+SHORTCUT_KEY_PREFIX = "hk_"
 USER_ROLES = (ADMIN, MEMBER)
 ALL_ROLES = (ADMIN, MEMBER, CONNECTOR)
 TOKEN_TTL = {ADMIN: 60 * 60 * 24 * 30, MEMBER: 60 * 60 * 24 * 365}
@@ -226,6 +228,64 @@ def authenticate(authorization: str | None) -> tuple[str, sqlite3.Row | None]:
     raise HTTPException(401, "Session expired, please log in again")
 
 
+# Siri Shortcut keys: long-lived, one per person, usable only for adding to lists.
+
+
+def _key_hash(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+
+
+def create_shortcut_key(user_id: int) -> str:
+    """A new key for this person, replacing any earlier one. Shown once; only its hash is kept."""
+    key = SHORTCUT_KEY_PREFIX + secrets.token_urlsafe(32)
+    with get_conn() as conn:
+        user = get_user(conn, user_id)
+        conn.execute("DELETE FROM shortcut_keys WHERE user_id = ?", (user_id,))
+        conn.execute(
+            "INSERT INTO shortcut_keys (user_id, key_hash, token_version, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, _key_hash(key), user["token_version"], _now()),
+        )
+    return key
+
+
+def shortcut_key_status(user_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT k.*, u.token_version AS current_version FROM shortcut_keys k JOIN users u ON u.id = k.user_id WHERE k.user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if row is None or row["token_version"] != row["current_version"]:
+        return None
+    return {"created_at": row["created_at"], "last_used_at": row["last_used_at"]}
+
+
+def revoke_shortcut_key(user_id: int) -> bool:
+    with get_conn() as conn:
+        return conn.execute("DELETE FROM shortcut_keys WHERE user_id = ?", (user_id,)).rowcount > 0
+
+
+def shortcut_key_user(authorization: str | None) -> sqlite3.Row | None:
+    """The active person whose current Siri key this bearer header carries; None otherwise."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    key = authorization.removeprefix("Bearer ").strip()
+    if not key.startswith(SHORTCUT_KEY_PREFIX):
+        return None
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM shortcut_keys WHERE key_hash = ?", (_key_hash(key),)).fetchone()
+        if row is None:
+            return None
+        user = get_user(conn, row["user_id"])
+        if not user or not user["active"] or user["token_version"] != row["token_version"]:
+            return None
+        conn.execute("UPDATE shortcut_keys SET last_used_at = ? WHERE user_id = ?", (_now(), user["id"]))
+    return user
+
+
 # Route-level role declarations. The middleware in main.py already guarantees a valid session
 # (request.state.role); these only decide *which* role may use the route.
 
@@ -247,4 +307,10 @@ def need_manager(request: Request) -> None:
         raise HTTPException(403, "Only an admin (or Claude) can change rooms")
 
 
-ROLE_DEPENDENCIES = (need_member, need_admin, need_manager)
+def need_shortcut(request: Request) -> None:
+    """Only a Siri Shortcut key (checked by the middleware on /api/shortcut/* paths)."""
+    if request.state.role != SHORTCUT or request.state.user is None:
+        raise HTTPException(401, "This needs a Siri Shortcut key")
+
+
+ROLE_DEPENDENCIES = (need_member, need_admin, need_manager, need_shortcut)

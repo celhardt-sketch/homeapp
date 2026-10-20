@@ -249,6 +249,19 @@ export interface UpkeepLog {
   reminder_sent_at: string | null
 }
 
+export interface ShortcutStatus {
+  has_key: boolean
+  created_at: string | null
+  last_used_at: string | null
+  url: string
+}
+
+export interface ShortcutKey {
+  key: string
+  authorization: string
+  url: string
+}
+
 export interface ConnectorStatus {
   mcp_url: string
   connected: boolean
@@ -432,6 +445,9 @@ export const api = {
   upkeepHistory: (id: number) => request<UpkeepLog[]>(`/api/upkeep/${id}/logs`),
   deleteUpkeepLog: (id: number) => request<void>(`/api/upkeep-logs/${id}`, { method: 'DELETE' }),
 
+  shortcutStatus: () => request<ShortcutStatus>('/api/me/shortcut'),
+  makeShortcutKey: () => request<ShortcutKey>('/api/me/shortcut', { method: 'POST' }),
+  revokeShortcutKey: () => request<{ revoked: boolean }>('/api/me/shortcut', { method: 'DELETE' }),
   connectorStatus: () => request<ConnectorStatus>('/api/admin/connector'),
   revokeConnector: () => request<{ revoked_tokens: number }>('/api/admin/connector', { method: 'DELETE' }),
   reminderSettings: () => request<ReminderSettings>('/api/admin/reminders'),
